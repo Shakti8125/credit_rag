@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+
+# Environment
+.env
+venv/
+rag_env/
+
+# Models
+models/
+*.gguf
+*.bin
+
+# Vector databases
+chroma/
+faiss_index/
+
+# Logs
+logs/
+
+# Data
+data/
+*.pdf
