@@ -1,16 +1,17 @@
 import sys
 import os
 from pathlib import Path
+from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
-# Ensure the project root (credit-risk-rag/) is on sys.path regardless of
-# which directory Streamlit was launched from.  Without this, `from local.x`
-# imports fail because Streamlit adds local/app/ to sys.path (the script's
-# own directory), not the project root two levels up.
+# Project root on sys.path — must happen before any `from local.x` import
 # ---------------------------------------------------------------------------
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # local/app/main.py → credit-risk-rag/
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+# Load .env (Pinecone + Gemini keys) before any service import
+load_dotenv(dotenv_path=_PROJECT_ROOT / "cloud" / "backend" / ".env")
 
 import io
 import time
@@ -18,48 +19,34 @@ import logging
 import streamlit as st
 import requests
 
-# ---------------------------------------------------------------------------
-# Module-level logger
-# ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
-API_ENDPOINT  = "http://127.0.0.1:8000/query"
-SLM_MODEL_PATH = r"local\slm\models\phi3-basel-q4km.gguf"
+API_ENDPOINT   = "http://127.0.0.1:8000/query"
+SLM_MODEL_PATH = r"C:\Users\Shakti\Desktop\credit-risk-rag_v_0.1\local\slm\models\phi3-basel-q4km.gguf"
+
+# Retrieval knobs
+_RERANK_POOL     = 20   # candidates fetched (bi-encoder) before cross-encoder reranking
+_PHI3_TOP_K      = 3    # final chunks fed to Phi-3 after reranking (fits 4096-token ctx)
+_FAISS_POOL      = 15   # candidates fetched from local FAISS before reranking
+_CLOUD_TOP_K     = 5    # final chunks sent to Gemini (larger ctx window)
+_CHUNK_CHAR_CAP  = 1200 # max chars per chunk in Phi-3 prompt (hard context guard)
 
 # ---------------------------------------------------------------------------
-# CACHED HEAVY RESOURCES
-# All three loaders run once per Streamlit worker process and are reused
-# across every session / rerun — no cold-start penalty after the first load.
+# CACHED HEAVY RESOURCES — loaded once per Streamlit worker process
 # ---------------------------------------------------------------------------
 
 @st.cache_resource(show_spinner="Initialising privacy pipeline (Docling + spaCy)…")
 def load_privacy_pipeline():
-    """
-    Boots PrivacyPipeline once per worker.
-    Internally initialises:
-      - DocumentExtractor  (Docling DocumentConverter with table-structure pipeline)
-      - DocumentMasker     (spaCy en_core_web_lg NER + financial-metric freeze rules)
-      - EntityRegistry     (thread-safe token ↔ entity map)
-      - DocumentValidator  (regex egress firewall)
-    """
     from local.privacy.pipeline import PrivacyPipeline
     return PrivacyPipeline(spacy_model="en_core_web_lg")
 
 
 @st.cache_resource(show_spinner="Loading local Phi-3 GGUF weights…")
 def load_inference_engine():
-    """
-    Loads LocalModelInference once per worker.
-    Used exclusively for LOCAL EDGE GENERATION (Phi-3 path) — NOT for intent
-    routing.  Intent classification is handled by classify_intent() using
-    deterministic keyword rules which are faster and more reliable.
-    Returns None gracefully if the model file is missing or llama-cpp is not
-    installed — the Gemini Pro cloud path remains fully operational.
-    """
     try:
         from local.slm.inference import LocalModelInference
         return LocalModelInference(model_path=SLM_MODEL_PATH, ctx_size=4096, gpu_layers=0)
@@ -71,14 +58,11 @@ def load_inference_engine():
         return None
 
 
-@st.cache_resource(show_spinner="Loading embedding model for local RAG…")
+@st.cache_resource(show_spinner="Loading sentence-transformer embedding model…")
 def load_embedding_model():
     """
-    Loads sentence-transformers all-MiniLM-L6-v2 once per worker (~80MB).
-    Used to embed document chunks and queries for the ephemeral FAISS index
-    that grounds Phi-3 on the uploaded document.
-    Runs entirely locally — no network calls after the initial model download.
-    Returns None gracefully if sentence-transformers is not installed.
+    Loads all-MiniLM-L6-v2 once per worker (~80 MB).
+    Used to build the ephemeral FAISS index over uploaded document chunks.
     """
     try:
         from sentence_transformers import SentenceTransformer
@@ -86,15 +70,41 @@ def load_embedding_model():
         logger.info("Embedding model loaded: all-MiniLM-L6-v2")
         return model
     except ImportError:
-        logger.warning(
-            "sentence-transformers not installed — local RAG disabled. "
-            "Install with: pip install sentence-transformers faiss-cpu"
-        )
+        logger.warning("sentence-transformers not installed — local FAISS RAG disabled.")
+        return None
+
+
+@st.cache_resource(show_spinner="Connecting to Pinecone (regulatory corpus)…")
+def load_pinecone_retriever():
+    """
+    Connects to the shared Pinecone index that holds the pre-loaded regulatory
+    corpus (CBUAE, Basel III, IFRS-9, etc.).
+    Used for GENERAL and HYBRID intents on the local Phi-3 path.
+    """
+    try:
+        from local.rag.pinecone_index import PineconeRetriever
+        return PineconeRetriever()
+    except Exception as e:
+        logger.warning("PineconeRetriever unavailable: %s", e)
+        return None
+
+
+@st.cache_resource(show_spinner="Loading cross-encoder reranker…")
+def load_reranker():
+    """
+    Loads cross-encoder/ms-marco-MiniLM-L-6-v2 once per worker.
+    Used to rerank both FAISS (doc) and Pinecone (regulatory) recall pools.
+    """
+    try:
+        from local.rag.reranker import CrossEncoderReranker
+        return CrossEncoderReranker()
+    except Exception as e:
+        logger.warning("CrossEncoderReranker unavailable: %s", e)
         return None
 
 
 # ---------------------------------------------------------------------------
-# UI COMPONENTS (imported after page config to avoid partial-import issues)
+# UI COMPONENTS
 # ---------------------------------------------------------------------------
 from components.upload_panel   import render_upload_panel
 from components.model_toggle   import render_model_toggle
@@ -110,34 +120,35 @@ st.set_page_config(
     page_title="Credit Risk RAG",
     page_icon="🏦",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
 # ---------------------------------------------------------------------------
 # SESSION STATE
 # ---------------------------------------------------------------------------
 _DEFAULTS = {
-    "last_execution_path": "Idle",
-    "last_citations":      [],
-    "last_intent":         "GENERAL",
-    "masked_entities":     {},        # {placeholder: original_entity} for masking_log
+    "last_execution_path":  "Idle",
+    "last_citations":       [],
+    "last_intent":          "GENERAL",
+    "masked_entities":      {},     # {placeholder: original_entity}  — for masking_log UI
     "preserved_financials": [],
-    "doc_text":            None,      # masked Markdown ready for cloud dispatch
-    "doc_index":           None,      # Pinecone retriever for shared RAG
-    "last_uploaded_file":  None,
-    "messages":            [],
-    "last_execution_time": None,
+    "doc_text":             None,   # masked Markdown — sent to cloud path
+    "doc_faiss_index":      None,   # LocalDocumentIndex built from uploaded doc
+    "registry":             None,   # EntityRegistry instance — for unmask_text()
+    "last_uploaded_file":   None,
+    "messages":             [],
+    "last_execution_time":  None,
 }
 for key, default in _DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = default
+
 
 # ---------------------------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------------------------
 
 def stream_response(text: str):
-    """Yields words one by one to simulate a live token stream."""
     if not text:
         yield "Error: Empty response."
         return
@@ -147,36 +158,51 @@ def stream_response(text: str):
 
 
 def _extract_preserved_financials(masked_text: str) -> list:
-    """
-    Re-scans the masked text for financial metrics that the DocumentMasker
-    deliberately left in place.  Uses the same pattern set as masker.py so the
-    two stay in sync.  Returns a deduplicated, sorted list for the masking log.
-    """
     import re
     patterns = [
-        # Currency with scale: $14.5M, AED 250k, USD 5,000,000
         re.compile(r'\b(?:AED|USD|EUR|GBP)?\s?[\$\u20AC\u00A3]?\s?\d+(?:,\d{3})*(?:\.\d+)?\s?(?:M|B|k|Million|Billion)?\b', re.IGNORECASE),
-        # Risk ratios: DSCR 1.25x, LTV 70%, Debt/EBITDA 3.5x
         re.compile(r'\b(?:DSCR|LTV|Leverage|TOL/ATNW|Debt/EBITDA|ROE|ROA)\b\s*(?:of|is)?\s*\d+(?:\.\d+)?\s?%?x?\b', re.IGNORECASE),
-        # Percentages: 10.25%
         re.compile(r'\b\d+(?:\.\d+)?\s?%\b'),
-        # Multipliers: 2.0x
         re.compile(r'\b\d+(?:\.\d+)?\s?x\b', re.IGNORECASE),
     ]
     found = set()
     for pattern in patterns:
         for match in pattern.finditer(masked_text):
             value = match.group().strip()
-            # Filter out bare single digits like "1" or "2" which match \d+x loosely
             if len(value) > 1:
                 found.add(value)
     return sorted(found)
 
 
+def _unmask_response(text: str) -> str:
+    """
+    Replaces placeholder tokens ([ORG_1], [PERSON_2] …) with original entity
+    names so the user never sees raw masked tokens in the UI.
+
+    Prefers EntityRegistry.unmask_text() which guarantees longest-key-first
+    replacement order. Falls back to the flat dict if registry is not available.
+    """
+    registry = st.session_state.get("registry")
+    if registry is not None:
+        return registry.unmask_text(text)
+    # Flat-dict fallback — sort by key length descending to avoid partial hits
+    mapping = st.session_state.get("masked_entities", {})
+    for placeholder in sorted(mapping.keys(), key=len, reverse=True):
+        text = text.replace(placeholder, mapping[placeholder])
+    return text
+
+
 def process_uploaded_document(uploaded_file) -> bool:
     """
-    Runs the uploaded file through PrivacyPipeline.process_document().
-    Stores results in session state.  Returns True on success, False on error.
+    Full document processing pipeline:
+      1. Docling extraction → masked Markdown (PrivacyPipeline)
+      2. EntityRegistry stored in session for response unmasking
+      3. MarkdownChunker → chunks
+      4. LocalDocumentIndex (FAISS) built from chunks — ephemeral, in-memory
+
+    The FAISS index is stored as st.session_state["doc_faiss_index"].
+    It is discarded automatically when a new document is uploaded or the
+    browser session ends — no disk writes, no network calls.
     """
     pipeline = load_privacy_pipeline()
     if pipeline is None:
@@ -184,43 +210,57 @@ def process_uploaded_document(uploaded_file) -> bool:
         return False
 
     try:
-        file_bytes = io.BytesIO(uploaded_file.getvalue())
+        # ── Phase 1: Extract + mask ───────────────────────────────────
         result = pipeline.process_document(
-            file_source=file_bytes,
-            filename=uploaded_file.name
+            file_source=io.BytesIO(uploaded_file.getvalue()),
+            filename=uploaded_file.name,
         )
 
-        # audit_log is List[{placeholder, original_entity, type}]
-        # masking_log.py iterates as: for entity_token, original_text in masked_entities.items()
-        # so key = placeholder ([ORG_1]), value = original entity ("RAKBANK")
         masked_entities = {
             entry["placeholder"]: entry["original_entity"]
             for entry in result["audit_log"]
         }
-
-        # Extract preserved financial metrics from the masked text.
-        # The pipeline keeps them in-place (doesn't mask them) but doesn't
-        # return them separately — so we scan for them here.
         preserved_financials = _extract_preserved_financials(result["masked_text"])
 
         logger.info(
             "Document processed: %d entities masked, %d financials preserved.",
-            len(masked_entities), len(preserved_financials)
+            len(masked_entities), len(preserved_financials),
         )
 
         st.session_state["doc_text"]             = result["masked_text"]
         st.session_state["masked_entities"]      = masked_entities
         st.session_state["preserved_financials"] = preserved_financials
         st.session_state["last_uploaded_file"]   = uploaded_file.name
+        # Store registry so we can call unmask_text() on LLM responses
+        st.session_state["registry"]             = result["registry_instance"]
 
-        # Shared Pinecone index is used by both cloud and local routes.
-        try:
-            from local.rag.pinecone_index import PineconeRetriever
-            st.session_state["doc_index"] = PineconeRetriever()
-        except Exception as idx_err:
-            logger.warning("Pinecone local retriever unavailable: %s", idx_err)
-            st.session_state["doc_index"] = None
+        # ── Phase 2: Chunk masked text ────────────────────────────────
+        from local.rag.chunker import MarkdownChunker
+        chunker = MarkdownChunker()
+        chunks  = chunker.chunk(result["masked_text"])
 
+        if not chunks:
+            logger.warning("Chunker produced 0 chunks — FAISS index will not be built.")
+            st.session_state["doc_faiss_index"] = None
+            return True
+
+        logger.info("Produced %d chunks from uploaded document.", len(chunks))
+
+        # ── Phase 3: Build ephemeral FAISS index ──────────────────────
+        embed_model = load_embedding_model()
+        if embed_model is None:
+            logger.warning("Embedding model unavailable — FAISS index skipped.")
+            st.session_state["doc_faiss_index"] = None
+            return True
+
+        from local.rag.local_index import LocalDocumentIndex
+        faiss_index = LocalDocumentIndex(embed_model)
+        faiss_index.build(chunks)
+        st.session_state["doc_faiss_index"] = faiss_index
+
+        logger.info(
+            "Ephemeral FAISS index ready: %d vectors.", faiss_index.chunk_count
+        )
         return True
 
     except Exception as e:
@@ -233,148 +273,196 @@ def process_uploaded_document(uploaded_file) -> bool:
         return False
 
 
-# Hard token budget for Phi-3 context.
-# LangChain chunks are character-based (800 chars ≈ 130 words ≈ 170 tokens).
-# 4 chunks × ~170 tokens = ~680 tokens — safe headroom within n_ctx=2048
-# after accounting for system prompt (~100 tokens) + answer (512 tokens).
-_PHI3_TOP_K = 4
+# ---------------------------------------------------------------------------
+# RETRIEVAL  — intent-aware, cross-encoder reranked
+# ---------------------------------------------------------------------------
 
-
-def _retrieve_phi3_context(prompt: str) -> tuple:
+def _retrieve_doc_chunks(query: str, top_k: int = _PHI3_TOP_K, for_cloud: bool = False) -> tuple:
     """
-    Retrieves the top-k most semantically relevant chunks from the ephemeral
-    FAISS index and assembles them into a context block for Phi-3.
+    Retrieves top-k chunks from the UPLOADED DOCUMENT via the ephemeral
+    FAISS index, reranked by the cross-encoder.
 
-    Returns
-    -------
-    (context_block: str, citations: list[dict])
-        context_block — formatted string to inject into the Phi-3 prompt
-        citations     — list of {text, section, score} dicts for UI display
-                        Empty list when falling back to keyword extraction.
+    Parameters
+    ----------
+    query     : user question
+    top_k     : final chunks after reranking
+    for_cloud : if True, use _CLOUD_TOP_K and return plain chunk text
+                (no Phi-3 system prompt wrapper) suitable for FastAPI payload.
+
+    Returns (context_block_or_raw_chunks: str, citations: list[dict])
     """
-    index    = st.session_state.get("doc_index")
-    doc_text = st.session_state.get("doc_text") or ""
+    effective_top_k = _CLOUD_TOP_K if for_cloud else top_k
 
-    # ── Path A: FAISS semantic retrieval ─────────────────────────────
-    if index is not None and index.is_built:
-        results = index.search(prompt, top_k=20)
+    faiss_index = st.session_state.get("doc_faiss_index")
+    reranker    = load_reranker()
 
-        if results:
-            try:
-                from local.rag.reranker import CrossEncoderReranker
-                reranked = CrossEncoderReranker().rerank(prompt, results, _PHI3_TOP_K)
-                results = [(c, float(sc)) for c, sc in reranked]
-            except Exception:
-                results = results[:_PHI3_TOP_K]
-            chunk_texts = []
-            citations   = []
-            for i, (chunk, score) in enumerate(results, 1):
-                header = f"[Section: {chunk.section}] " if chunk.section else ""
-                chunk_texts.append(f"Chunk {i} {header}(relevance {score:.2f}):\n{chunk.text}")
-                citations.append({
-                    "section": chunk.section or "Document",
-                    "text":    chunk.text,
-                    "score":   round(score, 3),
-                    "page":    f"Chunk {chunk.index + 1} of {index.chunk_count}",
-                })
+    if faiss_index is None or not faiss_index.is_built:
+        logger.warning("FAISS index not available — falling back to keyword extraction.")
+        return _keyword_fallback(query)
 
-            context = "\n\n---\n\n".join(chunk_texts)
-            total_words = len(doc_text.split())
-            context_block = (
-                "System: You are a credit risk analyst. "
-                "Answer the question using ONLY the document chunks below. "
-                "Be concise — complete your answer within 3-4 sentences. "
-                "If the answer is not in the chunks, say so.\n\n"
-                f"Retrieved Document Chunks ({_PHI3_TOP_K} of {index.chunk_count} total, "
-                f"document is {total_words:,} words):\n\n"
-                f"{context}\n\n"
-            )
-            return context_block, citations
+    # Bi-encoder recall
+    pool = faiss_index.search(query, top_k=_FAISS_POOL)
 
-    # ── Path B: Keyword fallback (no index available) ─────────────────
-    logger.warning("FAISS index unavailable — falling back to keyword extraction for Phi-3 context.")
+    # Cross-encoder rerank
+    if reranker is not None and len(pool) > 1:
+        ranked = reranker.rerank(query, pool, top_k=effective_top_k)
+    else:
+        ranked = [(chunk, score) for chunk, score in pool[:effective_top_k]]
+
+    if not ranked:
+        return _keyword_fallback(query)
+
+    chunk_texts = []
+    citations   = []
+    for i, (chunk, score) in enumerate(ranked, 1):
+        header = f"[Section: {chunk.section}] " if chunk.section else ""
+        # Hard cap per chunk for Phi-3 context budget
+        text = chunk.text if for_cloud else chunk.text[:_CHUNK_CHAR_CAP]
+        chunk_texts.append(f"Chunk {i} {header}(score {score:.3f}):\n{text}")
+        citations.append({
+            "section": chunk.section or "Document",
+            "text":    chunk.text,   # always store full text in citations
+            "score":   round(score, 3),
+            "page":    f"Chunk {chunk.index + 1} of {faiss_index.chunk_count}",
+        })
+
+    context = "\n\n---\n\n".join(chunk_texts)
+
+    if for_cloud:
+        # Raw chunk text — PromptBuilder in query.py will wrap this
+        return context, citations
+
+    # Phi-3 formatted context block
+    context_block = (
+        "System: You are a credit risk analyst. "
+        "Answer the question using ONLY the document chunks below. "
+        "Be concise — 3-4 sentences. "
+        "If the answer is not in the chunks, say so.\n\n"
+        f"Document Chunks (top-{effective_top_k}, cross-encoder reranked):\n\n{context}\n\n"
+    )
+    return context_block, citations
+
+
+def _retrieve_regulatory_chunks(query: str, top_k: int = _PHI3_TOP_K) -> tuple:
+    """
+    Retrieves top-k chunks from the REGULATORY CORPUS (Pinecone) reranked
+    by the cross-encoder.
+
+    Returns (context_block: str, citations: list[dict])
+    Used for GENERAL intent (and the regulatory half of HYBRID).
+    """
+    pinecone = load_pinecone_retriever()
+    reranker = load_reranker()
+
+    if pinecone is None:
+        logger.warning("Pinecone unavailable — no regulatory context.")
+        return "", []
+
+    # Bi-encoder recall
+    pool = pinecone.search(query, top_k=_RERANK_POOL)
+
+    # Cross-encoder rerank
+    if reranker is not None and len(pool) > 1:
+        ranked = reranker.rerank(query, pool, top_k=top_k)
+    else:
+        ranked = [(chunk, 0.0) for chunk in pool[:top_k]]
+
+    if not ranked:
+        return "", []
+
+    chunk_texts = []
+    citations   = []
+    for i, (chunk, score) in enumerate(ranked, 1):
+        header = f"[{chunk.section}] " if chunk.section else ""
+        chunk_texts.append(f"Chunk {i} {header}(score {score:.3f}):\n{chunk.text}")
+        citations.append({
+            "section": chunk.section or "Regulatory Corpus",
+            "text":    chunk.text,
+            "score":   round(score, 3),
+            "page":    f"Chunk {chunk.index + 1}",
+        })
+
+    context = "\n\n---\n\n".join(chunk_texts)
+    context_block = (
+        f"Regulatory Chunks (top-{top_k}, cross-encoder reranked):\n\n{context}\n\n"
+    )
+    return context_block, citations
+
+
+def _keyword_fallback(query: str) -> tuple:
+    """
+    Keyword-based extraction from doc_text when FAISS is unavailable.
+    Returns (context_block, []) — no citations for fallback.
+    """
+    doc_text   = st.session_state.get("doc_text") or ""
     paragraphs = [p.strip() for p in doc_text.split("\n\n") if p.strip()]
     STOP = {"what", "is", "the", "a", "an", "of", "in", "this", "about",
             "are", "how", "does", "do", "which", "can", "be", "to", "and"}
-    keywords = {w.lower() for w in prompt.split() if w.lower() not in STOP and len(w) > 2}
+    keywords = {w.lower() for w in query.split() if w.lower() not in STOP and len(w) > 2}
     scored = sorted(
         paragraphs,
         key=lambda p: len(keywords & {w.lower().strip(".,;:()[]") for w in p.split()}),
-        reverse=True
+        reverse=True,
     )
     excerpt_words: list = []
     for para in scored:
         words = para.split()
-        if len(excerpt_words) + len(words) > 400:
+        if len(excerpt_words) + len(words) > 500:
             break
         excerpt_words.extend(words)
-
-    excerpt = " ".join(excerpt_words) if excerpt_words else " ".join(doc_text.split()[:400])
+    excerpt = " ".join(excerpt_words) if excerpt_words else " ".join(doc_text.split()[:500])
     context_block = (
         "System: You are a credit risk analyst. "
-        "Answer based on the document excerpt below. "
-        "Be concise — complete your answer within 3-4 sentences.\n\n"
+        "Answer based on the document excerpt below. Be concise (3-4 sentences).\n\n"
         f"Document Excerpt:\n{excerpt}\n\n"
     )
     return context_block, []
 
 
+# ---------------------------------------------------------------------------
+# INTENT CLASSIFIER
+# ---------------------------------------------------------------------------
+
 def classify_intent(prompt: str, document_attached: bool, selected_model: str) -> str:
     """
     Deterministic keyword-based intent classifier.
 
-    The intent space is fully determined by two binary signals — document
-    attached and model selected — with one genuine ambiguity: when a document
-    IS attached and Gemini Pro is selected, we need to distinguish EXTRACT
-    (answer from the document) vs HYBRID (answer requires document + regulatory
-    vector store).  A keyword scan resolves this in O(n) with zero latency and
-    zero failure modes.
-
-    An SLM router was evaluated but rejected: the input dimensionality is too
-    low to justify inference latency (~300ms/query) and the additional failure
-    mode of mis-classification.  The Phi-3 GGUF is reserved for generation on
-    the Local Edge path only.
+    Intents:
+      EXTRACT   — answer lives entirely in the uploaded document
+      HYBRID    — needs uploaded doc + regulatory corpus
+      BENCHMARK — no doc; pure regulatory knowledge retrieval
+      GENERAL   — no doc; conversational / domain knowledge
     """
-    # Phi-3 Local Edge: always document-grounded or pure conversational
     if selected_model == "Phi-3 (Local Edge)":
-        return "EXTRACT" if document_attached else "GENERAL"
+        if not document_attached:
+            return "GENERAL"
+        HYBRID_SIGNALS = {
+            "compare", "comparison", "versus", "vs", "against", "relative",
+            "benchmark", "benchmarking", "exceed", "below", "above", "breach",
+            "guideline", "guidelines", "policy", "policies", "requirement",
+            "requirements", "comply", "compliant", "compliance", "threshold",
+            "limit", "limits", "minimum", "maximum", "meet", "meets", "satisfy",
+            "cbuae", "basel", "rbi", "ifrs", "ifrs9", "sr11-7", "eba", "bcbs",
+        }
+        query_tokens = set(prompt.lower().split())
+        return "HYBRID" if query_tokens & HYBRID_SIGNALS else "EXTRACT"
 
-    # Gemini Pro, no document: pure regulatory knowledge retrieval
+    # Gemini Pro path
     if not document_attached:
         return "BENCHMARK"
 
-    # Gemini Pro + document attached: only real decision point
-    # HYBRID = needs both the uploaded doc AND the Pinecone regulatory archive
-    # EXTRACT = answer lives entirely within the uploaded document
     HYBRID_SIGNALS = {
-        # Comparison language
         "compare", "comparison", "versus", "vs", "against", "relative",
         "benchmark", "benchmarking", "exceed", "below", "above", "breach",
-        # Compliance / regulatory language
         "guideline", "guidelines", "policy", "policies", "requirement",
         "requirements", "comply", "compliant", "compliance", "threshold",
         "limit", "limits", "minimum", "maximum", "meet", "meets", "satisfy",
-        # Specific regulatory frameworks in the Pinecone index
         "cbuae", "basel", "rbi", "ifrs", "ifrs9", "sr11-7", "eba", "bcbs",
     }
     query_tokens = set(prompt.lower().split())
     intent = "HYBRID" if query_tokens & HYBRID_SIGNALS else "EXTRACT"
-
-    logger.info("Intent classified as '%s' (document_attached=%s, model=%s)",
-                intent, document_attached, selected_model)
+    logger.info("Intent='%s' (doc=%s model=%s)", intent, document_attached, selected_model)
     return intent
-
-
-
-def _unmask_response(text: str) -> str:
-    """Restore original entities before showing output."""
-    try:
-        mapping = st.session_state.get("masked_entities", {})
-        for placeholder, original in mapping.items():
-            text = text.replace(placeholder, original)
-        return text
-    except Exception:
-        return text
 
 
 # ---------------------------------------------------------------------------
@@ -385,11 +473,13 @@ with st.sidebar:
     uploaded_file  = render_upload_panel()
     selected_model = render_model_toggle()
 
-    # Process document only when a *new* file is uploaded
     if uploaded_file and (st.session_state["last_uploaded_file"] != uploaded_file.name):
-        with st.spinner("Extracting layout with Docling and scrubbing PII locally…"):
+        with st.spinner("Extracting layout, scrubbing PII, building document index…"):
             success = process_uploaded_document(uploaded_file)
         if success:
+            faiss_idx = st.session_state.get("doc_faiss_index")
+            if faiss_idx and faiss_idx.is_built:
+                st.success(f"✅ Indexed {faiss_idx.chunk_count} chunks from document.")
             st.rerun()
 
 # ---------------------------------------------------------------------------
@@ -404,13 +494,13 @@ with col2:
         st.metric(
             label="⏱️ Inference Latency",
             value=f"{st.session_state['last_execution_time']} sec",
-            help="Total time from query submission to rendered response."
+            help="Total time from query submission to rendered response.",
         )
 
     if st.session_state["doc_text"]:
         render_masking_log(
             st.session_state["masked_entities"],
-            st.session_state["preserved_financials"]
+            st.session_state["preserved_financials"],
         )
 
 with col1:
@@ -421,29 +511,17 @@ with col1:
     # ------------------------------------------------------------------
     if prompt:
         document_attached = bool(st.session_state["doc_text"])
-
-        # ── Intent classification ──────────────────────────────────────
         intent = classify_intent(prompt, document_attached, selected_model)
-
-        payload = {
-            "query":        prompt,
-            "intent":       intent,
-            "doc_text":     st.session_state["doc_text"],
-            "masked_items": st.session_state["masked_entities"],
-        }
-
-        # NOTE: user message is already appended + rendered by render_chat_interface().
-        # Do NOT append again here — that causes the duplicate message visible in chat.
 
         try:
             with st.chat_message("assistant"):
                 with st.spinner("Analysing parameters…"):
                     start_time = time.time()
 
-                    # ── PATH A: LOCAL EDGE (Phi-3 GGUF) ──────────────
+                    # ── PATH A: LOCAL EDGE (Phi-3) ────────────────────
                     if selected_model == "Phi-3 (Local Edge)":
-                        engine        = load_inference_engine()
-                        local_citations = []   # initialise here; populated below if index available
+                        engine          = load_inference_engine()
+                        local_citations = []
 
                         if engine is None:
                             answer_text = (
@@ -452,100 +530,128 @@ with col1:
                                 f"model exists at `{SLM_MODEL_PATH}`."
                             )
                         else:
-                            raw_context = st.session_state.get("doc_text") or ""
-                            has_doc = bool(raw_context.strip())
+                            if intent == "EXTRACT":
+                                st.caption("Retrieving from uploaded document (FAISS + cross-encoder)…")
+                                doc_context, local_citations = _retrieve_doc_chunks(prompt)
+                                reg_context = ""
+                            elif intent == "HYBRID":
+                                st.caption("Retrieving from document and regulatory corpus…")
+                                doc_context, doc_cit = _retrieve_doc_chunks(prompt)
+                                reg_context, reg_cit = _retrieve_regulatory_chunks(prompt)
+                                local_citations = doc_cit + reg_cit
+                            else:  # GENERAL
+                                st.caption("Retrieving from regulatory corpus (Pinecone + cross-encoder)…")
+                                doc_context = ""
+                                reg_context, local_citations = _retrieve_regulatory_chunks(prompt)
 
-                            if has_doc:
-                                context_block, local_citations = _retrieve_phi3_context(prompt)
+                            system_prefix = (
+                                "System: You are a credit risk analyst. "
+                                "Answer only within the domain of credit risk, banking regulation, "
+                                "financial analysis, and risk management. "
+                                "Be concise — 3-4 sentences. "
+                                "Use credit risk definitions for domain terms "
+                                "(e.g. CAR = Capital Adequacy Ratio, PD = Probability of Default).\n\n"
+                            )
+
+                            if intent == "EXTRACT" and doc_context:
+                                context_section = doc_context
+                            elif intent == "HYBRID":
+                                parts = []
+                                if doc_context:
+                                    parts.append(f"Uploaded Document Context:\n{doc_context}")
+                                if reg_context:
+                                    parts.append(f"Regulatory Context:\n{reg_context}")
+                                context_section = "\n\n".join(parts)
+                            elif reg_context:
+                                context_section = f"Regulatory Context:\n{reg_context}"
                             else:
-                                local_citations = []
-                                # GENERAL path — no document attached.
-                                # Inject a credit risk domain system prompt so the model
-                                # answers within the credit risk domain rather than
-                                # drawing on unrelated general knowledge.
-                                context_block = (
-                                    "System: You are a credit risk analyst assistant. "
-                                    "Answer only within the domain of credit risk, banking regulation, "
-                                    "financial analysis, and risk management. "
-                                    "Be concise — complete your answer within 3-4 sentences. "
-                                    "If a term has a specific credit risk meaning (e.g. CAR = Capital "
-                                    "Adequacy Ratio, PD = Probability of Default, LGD = Loss Given "
-                                    "Default), always use the credit risk definition. "
-                                    "Do not answer questions outside this domain.\n\n"
-                                )
+                                context_section = ""
 
                             slm_prompt = (
                                 f"<|user|>\n"
-                                f"{context_block}"
+                                f"{system_prefix}"
+                                f"{context_section}"
                                 f"Question: {prompt}\n<|end|>\n<|assistant|>"
                             )
-                            st.caption("Generating response offline via Phi-3…")
-                            # 512 tokens gives enough room for a complete answer.
-                            # The context block is already bounded by _PHI3_TOP_K chunks
-                            # so total prompt + answer stays within n_ctx=2048.
-                            raw_answer  = engine.run_inference(slm_prompt, max_tokens=512)
-                            answer_text = f"*(Local Edge Inference)* {raw_answer}"
 
-                        st.session_state["last_execution_path"] = "Local Edge (Phi-3)"
+                            st.caption("Generating response offline via Phi-3…")
+                            raw_answer  = engine.run_inference(slm_prompt, max_tokens=512)
+                            answer_text = f"*(Local Edge — {intent})* {raw_answer}"
+
+                        # Local path: unmask before display
+                        answer_text = _unmask_response(answer_text)
+                        st.session_state["last_execution_path"] = f"Local Edge · Phi-3 · {intent}"
                         st.session_state["last_citations"]      = local_citations
                         st.session_state["last_intent"]         = intent
-                        answer_text = _unmask_response(answer_text)
                         st.write_stream(stream_response(answer_text))
                         render_citations(intent, local_citations)
 
                     # ── PATH B: CLOUD ORCHESTRATION (Gemini Pro) ──────
-# ---------- PATH B: CLOUD ORCHESTRATION (Gemini Pro) ----------
                     else:
-                        st.caption("Routing scrubbed payload to FastAPI orchestration tier...")
+                        # Retrieve relevant chunks locally first, send only those
+                        # to the cloud — NOT the full doc_text.
+                        # for_cloud=True: plain chunk text, no Phi-3 system prefix,
+                        # uses _CLOUD_TOP_K, no _CHUNK_CHAR_CAP truncation.
+                        doc_payload_text    = ""
+                        cloud_doc_citations = []
+                        if document_attached and intent in ["EXTRACT", "HYBRID"]:
+                            st.caption("Retrieving relevant chunks from uploaded document (FAISS)…")
+                            doc_payload_text, cloud_doc_citations = _retrieve_doc_chunks(
+                                prompt, for_cloud=True
+                            )
 
-                        response = requests.post(
-                            API_ENDPOINT,
-                            json=payload,
-                            timeout=120
-                        )
+                        payload = {
+                            "query":        prompt,
+                            "intent":       intent,
+                            "doc_text":     doc_payload_text,   # masked chunk text only
+                            "masked_items": st.session_state["masked_entities"],
+                        }
+
+                        # Debug — visible in terminal, never in UI
+                        logger.info("--- Outgoing FastAPI Payload ---")
+                        logger.info("Query  : %s", payload["query"])
+                        logger.info("Intent : %s", payload["intent"])
+                        preview = (payload["doc_text"] or "")[:200]
+                        logger.info("doc_text preview (200 chars): %s%s",
+                                    preview, "…" if len(payload["doc_text"] or "") > 200 else "")
+                        logger.info("masked_items count: %d", len(payload["masked_items"] or {}))
+                        logger.info("--------------------------------")
+
+                        st.caption("Routing scrubbed chunk payload to FastAPI orchestration tier…")
+                        response = requests.post(API_ENDPOINT, json=payload, timeout=120)
 
                         if response.status_code == 200:
+                            data    = response.json()
+                            raw_ans = data.get("answer", "")
 
-                            data = response.json()
-
-                            answer_text = data.get("answer", "")
+                            # Unmask LLM response — user sees real entity names
+                            answer_text = _unmask_response(raw_ans)
 
                             st.session_state["last_execution_path"] = data.get(
-                                "path",
-                                "Cloud Hybrid Orchestrated"
+                                "path", "Cloud Orchestrated"
                             )
+                            # Merge local doc citations with regulatory citations from cloud
+                            backend_citations = data.get("citations", [])
+                            st.session_state["last_citations"] = cloud_doc_citations + backend_citations
+                            st.session_state["last_intent"]    = intent
 
-                            st.session_state["last_citations"] = data.get(
-                                "citations",
-                                []
-                            )
-
-                            st.session_state["last_intent"] = intent
-
-
-                            # Restore original entities before showing user
-                            answer_text = _unmask_response(answer_text)
-
-
-                            st.write_stream(
-                                stream_response(answer_text)
-                            )
-
-
-                            render_citations(
-                                intent,
-                                st.session_state["last_citations"]
-                            )
-
-
+                            st.write_stream(stream_response(answer_text))
+                            render_citations(intent, st.session_state["last_citations"])
                         else:
-
-                            answer_text = (
-                                f"API Error {response.status_code}: "
-                                f"{response.text}"
-                            )
-
+                            answer_text = f"API Error {response.status_code}: {response.text}"
                             st.error(answer_text)
+
+                    # ── TIMING + HISTORY ──────────────────────────────
+                    elapsed = round(time.time() - start_time, 2)
+                    st.session_state["last_execution_time"] = elapsed
+                    st.caption(f"⏱️ **Response generated in {elapsed} seconds.**")
+                    st.session_state["messages"].append({
+                        "role":      "assistant",
+                        "content":   answer_text,
+                        "citations": st.session_state["last_citations"],
+                        "time":      elapsed,
+                    })
+                    st.rerun()
 
         except requests.exceptions.ConnectionError:
             st.error(

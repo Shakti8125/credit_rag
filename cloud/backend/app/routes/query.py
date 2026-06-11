@@ -1,162 +1,296 @@
+"""
+cloud/backend/app/routes/query.py
+
+Cloud RAG inference endpoint.
+
+Flow per request:
+  1. Retrieve relevant chunks from Pinecone (BENCHMARK / HYBRID / GENERAL)
+     with cross-encoder reranking — via PineconeRetrievalService.
+  2. For EXTRACT / HYBRID: retrieve relevant chunks from the uploaded
+     document via an ephemeral FAISS index built server-side from doc_text
+     (if full text is provided), or leverage pre-compiled client chunks.
+  3. Build prompt using PromptBuilder templates.
+  4. Generate answer with Gemini via GenerationService.
+  5. Unmask the LLM response and citation metadata cards before returning.
+"""
+
 import logging
-from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 
-# Import both the Generation and Retrieval services
+from fastapi import APIRouter, HTTPException, status
+from pydantic import BaseModel
+
 from app.services.generation import GenerationService
-try:
-    from app.services.retrieval import PineconeRetrievalService
-except ImportError:
-    PineconeRetrievalService = None
+from app.services.retrieval  import PineconeRetrievalService, Citation
+from app.services.prompt_builder import PromptBuilder
+from app.services.doc_injector   import DocumentInjector
 
 logger = logging.getLogger(__name__)
-
-# Primary routing instance
 router = APIRouter()
 
-# --- INITIALIZE SERVICES ---
+# ---------------------------------------------------------------------------
+# Service singletons (initialised once at import time)
+# ---------------------------------------------------------------------------
 try:
     llm_engine = GenerationService()
 except Exception as e:
-    logger.warning(f"Could not initialize GenerationService (API key might be missing): {e}")
+    logger.warning("GenerationService unavailable: %s", e)
     llm_engine = None
 
 try:
-    if PineconeRetrievalService:
-        retrieval_engine = PineconeRetrievalService()
-    else:
-        retrieval_engine = None
+    retrieval_engine = PineconeRetrievalService()
 except Exception as e:
-    logger.warning(f"Could not initialize PineconeRetrievalService: {e}")
+    logger.warning("PineconeRetrievalService unavailable: %s", e)
     retrieval_engine = None
 
+doc_injector = DocumentInjector()   # token-length gatekeeper for doc payloads
 
-# --- INLINE SCHEMAS ---
+# Retrieval knobs
+_CLOUD_TOP_K       = 6    # final chunks after reranking
+_CLOUD_RERANK_POOL = 20  # bi-encoder recall pool before cross-encoder
+
+
+# ---------------------------------------------------------------------------
+# Inline schemas
+# ---------------------------------------------------------------------------
 class QueryRequest(BaseModel):
-    query: str
-    intent: str
-    doc_text: Optional[str] = None
-    masked_items: Optional[Dict[str, str]] = None
+    query:        str
+    intent:       str
+    doc_text:     Optional[str]            = None
+    masked_items: Optional[Dict[str, str]] = None   # {placeholder: original_entity}
+
 
 class QueryResponse(BaseModel):
-    answer: str
-    path: str
+    answer:    str
+    path:      str
     citations: List[Dict[str, Any]] = []
 
-# --- ROUTE HANDLER ---
-@router.post(
-    "/query",
-    response_model=QueryResponse,
-    status_code=status.HTTP_200_OK
-)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _unmask_text(text: str, masked_items: Optional[Dict[str, str]]) -> str:
+    """
+    Replaces placeholder tokens in text structures with original entity names.
+    Replacements applied longest-key-first to prevent partial substitution
+    (e.g. [ORG_10] matched before [ORG_1]).
+    """
+    if not masked_items or not text:
+        return text
+    result = text
+    for placeholder in sorted(masked_items.keys(), key=len, reverse=True):
+        result = result.replace(placeholder, masked_items[placeholder])
+    return result
+
+
+def _build_faiss_index_from_doc(doc_text: str):
+    """
+    Builds an ephemeral in-memory FAISS index from the masked doc_text.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+        from local.rag.chunker     import MarkdownChunker
+        from local.rag.local_index import LocalDocumentIndex
+
+        chunker = MarkdownChunker()
+        chunks  = chunker.chunk(doc_text)
+
+        if not chunks:
+            logger.warning("Cloud doc chunker produced 0 chunks.")
+            return None
+
+        embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+        index       = LocalDocumentIndex(embed_model)
+        index.build(chunks)
+        logger.info("Cloud ephemeral FAISS: %d chunks indexed.", index.chunk_count)
+        return index
+
+    except ImportError as e:
+        logger.warning("FAISS/sentence-transformers unavailable on cloud env: %s", e)
+        return None
+    except Exception as e:
+        logger.error("Cloud FAISS build failed: %s", e, exc_info=True)
+        return None
+
+
+def _retrieve_doc_chunks_cloud(query: str, doc_text: str) -> List[Citation]:
+    """
+    Retrieves relevant chunks from the uploaded document using FAISS +
+    cross-encoder reranking. Protects against re-chunking if chunks are 
+    already optimized by the client-side engine.
+    """
+    # Safeguard: If the frontend already passed pre-compiled, formatted context blocks, bypass indexing
+    if "Document Chunks" in doc_text or "System:" in doc_text:
+        return []
+
+    faiss_index = _build_faiss_index_from_doc(doc_text)
+    if faiss_index is None or not faiss_index.is_built:
+        return []
+
+    # Bi-encoder recall
+    pool = faiss_index.search(query, top_k=_CLOUD_RERANK_POOL)
+
+    # Cross-encoder rerank if retrieval_engine has one loaded
+    if (
+        retrieval_engine is not None
+        and retrieval_engine._cross_encoder is not None
+        and len(pool) > 1
+    ):
+        pairs  = [(query, chunk.text) for chunk, _ in pool]
+        scores = retrieval_engine._cross_encoder.predict(pairs)
+        ranked = sorted(
+            zip([c for c, _ in pool], scores),
+            key=lambda x: x[1],
+            reverse=True,
+        )[:_CLOUD_TOP_K]
+    else:
+        ranked = [(chunk, score) for chunk, score in pool[:_CLOUD_TOP_K]]
+
+    citations = []
+    for chunk, score in ranked:
+        citations.append(Citation(
+            source       = "Uploaded Document",
+            section      = chunk.section or "Document",
+            text         = chunk.text,
+            page         = chunk.index,
+            rerank_score = float(score),
+        ))
+    return citations
+
+
+# ---------------------------------------------------------------------------
+# Route handler
+# ---------------------------------------------------------------------------
+
+@router.post("/query", response_model=QueryResponse, status_code=status.HTTP_200_OK)
 async def handle_rag_inference(payload: QueryRequest):
     """
-    HTTP POST route processing operational client traffic.
-    Now equipped with dynamic Pinecone Vector Retrieval and PII Masking.
+    Cloud RAG inference pipeline routing execution payloads dynamically based on intent.
     """
-    logger.info(f"Routing cloud execution pipeline for received intent: {payload.intent}")
-    
+    logger.info("Cloud pipeline request incoming: intent=%s", payload.intent)
+
     try:
         if not llm_engine:
-            raise ValueError("Cloud LLM Engine is offline.")
+            raise ValueError("Cloud LLM generation engine instance is offline.")
 
-        citations_output = []
-        retrieved_context = ""
+        reg_citations: List[Citation]  = []
+        doc_citations: List[Citation]  = []
+        citations_output: List[Dict]   = []
 
-        # =====================================================================
-        # 1. RETRIEVAL PHASE (Triggered if intent requires base regulatory documents)
-        # =====================================================================
-        if payload.intent in ["BENCHMARK", "GENERAL", "HYBRID"] and retrieval_engine:
+        # =================================================================
+        # 1. RETRIEVAL PHASE
+        # =================================================================
+
+        # Regulatory corpus (Pinecone) — BENCHMARK, GENERAL, HYBRID
+        if payload.intent in ("BENCHMARK", "GENERAL", "HYBRID") and retrieval_engine:
             try:
-                # Query Pinecone for the top 3 most relevant chunks
-                raw_citations = retrieval_engine.retrieve_context(
-                    query=payload.query, 
-                    namespace="cbuae-manuals", # Change this if your Pinecone namespace is different
-                    top_k=3 
+                reg_citations = retrieval_engine.retrieve_context(
+                    query=payload.query,
+                    namespace="cbuae-manuals",
+                    top_k=_CLOUD_TOP_K,
+                    rerank_pool=_CLOUD_RERANK_POOL,
                 )
-                
-                # Format context string and prepare citations for the Streamlit UI
-                context_blocks = []
-                for c in raw_citations:
-                    context_blocks.append(f"--- Document: {c.source} (Page {c.page}) ---\n{c.text}")
-                    citations_output.append({
-                        "source": c.source,
-                        "page": c.page,
-                        "text": c.text
-                    })
-                
-                retrieved_context = "\n\n".join(context_blocks)
-            except Exception as retrieve_err:
-                logger.warning(f"Pinecone retrieval failed: {retrieve_err}")
+            except Exception as e:
+                logger.warning("Pinecone infrastructure retrieval failed: %s", e)
 
-        # =====================================================================
-        # 2. MASKING & DYNAMIC PROMPT CONSTRUCTION PHASE
-        # =====================================================================
-        
-        # Start with the raw document text from the payload
-        scrubbed_doc_text = payload.doc_text if payload.doc_text else ""
-        
-        # Apply the masking dictionary if items are present
-        if payload.masked_items and scrubbed_doc_text:
-            logger.info("Applying PII masking/scrubbing to uploaded document text...")
-            for placeholder, original_value in payload.masked_items.items():
-                # Replace the sensitive original value with its safe placeholder (e.g., 'COMPANY_A')
-                scrubbed_doc_text = scrubbed_doc_text.replace(original_value, placeholder)
+        # Uploaded document (FAISS) — EXTRACT, HYBRID
+        if payload.intent in ("EXTRACT", "HYBRID") and payload.doc_text:
+            try:
+                doc_citations = _retrieve_doc_chunks_cloud(payload.query, payload.doc_text)
+            except Exception as e:
+                logger.warning("Doc-level local FAISS extraction failed: %s", e)
 
+        # =================================================================
+        # 2. PROMPT CONSTRUCTION
+        # =================================================================
+        execution_path = ""
         prompt_string = ""
-        execution_path_name = ""
 
-        if payload.intent == "HYBRID" and scrubbed_doc_text:
-            execution_path_name = "Cloud Hybrid (Uploaded Memo + Pinecone RAG)"
-            prompt_string = (
-                f"You are a credit risk analyst. Use the two sources below to answer the query.\n\n"
-                f"SOURCE 1: Uploaded Client Memo (Scrubbed)\n{scrubbed_doc_text}\n\n"
-                f"SOURCE 2: Institutional Base Documents / Guidelines\n{retrieved_context}\n\n"
-                f"Question: {payload.query}"
-            )
-        
-        elif payload.intent in ["BENCHMARK", "GENERAL"]:
-            execution_path_name = "Cloud RAG (Pinecone Base Docs)"
-            prompt_string = (
-                f"You are a credit risk analyst. Use the regulatory guidelines provided below to answer the query.\n\n"
-                f"Base Regulatory Context:\n{retrieved_context}\n\n"
-                f"Question: {payload.query}"
-            )
+        # Check if the incoming payload text contains pre-formatted client-side RAG blocks
+        is_client_preformatted = payload.doc_text and ("Document Chunks" in payload.doc_text or "System:" in payload.doc_text)
+
+        if is_client_preformatted:
+            # Clean optimization pass: use pre-compiled chunk layout directly
+            execution_path = f"Cloud Orchestrated · Gemini Pro · {payload.intent} (Client Edge Chunks Optimized)"
             
-        else: # EXTRACT intent
-            execution_path_name = "Cloud Extraction (Uploaded Memo Only)"
-            prompt_string = (
-                f"Context:\n{scrubbed_doc_text}\n\n"
-                f"Question:\n{payload.query}"
-            )
+            if payload.intent == "HYBRID" and reg_citations:
+                # Splice in backend regulatory contexts natively next to pre-formatted local chunks
+                reg_context = "\n\n".join([f"Regulatory Chunk (score {c.rerank_score:.3f}):\n{c.text}" for c in reg_citations])
+                prompt_string = (
+                    f"{payload.doc_text}\n\n"
+                    f"Regulatory Context Additions:\n{reg_context}\n\n"
+                    f"Question: {payload.query}"
+                )
+            else:
+                prompt_string = f"{payload.doc_text}\n\nQuestion: {payload.query}"
+        else:
+            # Full fallback framework processing path if raw full string text is injected
+            if payload.intent == "HYBRID":
+                execution_path = "Cloud Hybrid (Doc Chunks + Pinecone RAG)"
+                prompt_string  = PromptBuilder.hybrid_prompt(
+                    query=payload.query,
+                    citations=reg_citations,
+                    doc_citations=doc_citations,
+                )
 
-        # Safety fallback
+            elif payload.intent == "EXTRACT":
+                execution_path = "Cloud Extraction (Doc Chunks — FAISS reranked)"
+                if doc_citations:
+                    prompt_string = PromptBuilder.audit_prompt(
+                        query=payload.query,
+                        doc_citations=doc_citations,
+                    )
+                else:
+                    execution_path = "Cloud Extraction (Full Doc Injection — FAISS unavailable)"
+                    safe_doc       = doc_injector.prepare_payload(payload.doc_text or "")
+                    prompt_string  = PromptBuilder.audit_prompt_full_doc(
+                        query=payload.query,
+                        doc_text=safe_doc,
+                    )
+
+            else:  # BENCHMARK / GENERAL
+                execution_path = "Cloud RAG (Pinecone — cross-encoder reranked)"
+                prompt_string  = PromptBuilder.grounding_prompt(
+                    query=payload.query,
+                    citations=reg_citations,
+                )
+
         if not prompt_string.strip():
             prompt_string = payload.query
 
-        # 🔍 DEBUG PRINT: This will print the exact prompt text directly to your terminal screen
-        print("\n" + "="*50)
-        print("🚀 [DEBUG] EXACT PROMPT BEING SENT TO GEMINI:")
-        print("="*50)
-        print(prompt_string)
-        print("="*50 + "\n")
+        # =================================================================
+        # 3. GENERATION
+        # =================================================================
+        raw_answer = llm_engine.generate_text(prompt=prompt_string)
 
-        # =====================================================================
-        # 3. GENERATION PHASE
-        # =====================================================================
-        answer_text = llm_engine.generate_text(prompt=prompt_string)
+        # =================================================================
+        # 4. UNMASK RESPONSE & CITATIONS
+        # Handles both text generation blocks and citation card arrays 
+        # so the client UI completely bypasses any missing replacement fields.
+        # =================================================================
+        answer_text = _unmask_text(raw_answer, payload.masked_items)
 
-        # Return the comprehensive JSON structure
+        # Unmask text fields inside the citation mappings to hide raw placeholders
+        for c in doc_citations + reg_citations:
+            unmasked_citation_text = _unmask_text(c.text, payload.masked_items)
+            citations_output.append({
+                "source":       c.source,
+                "section":      c.section,
+                "page":         c.page,
+                "text":         unmasked_citation_text,  # ✅ Clear text for expanding UI source components
+                "rerank_score": c.rerank_score,
+            })
+
         return QueryResponse(
             answer=answer_text,
-            path=execution_path_name,
-            citations=citations_output
+            path=execution_path,
+            citations=citations_output,
         )
-        
+
     except Exception as e:
-        logger.error(f"Pipeline breakdown within route controller: {str(e)}", exc_info=True)
+        logger.error("Cloud inference engine runtime pipeline error: %s", e, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Cloud execution error: {str(e)}"
+            detail=f"Cloud execution error: {str(e)}",
         )
