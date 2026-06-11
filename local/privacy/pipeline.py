@@ -37,7 +37,7 @@ class PrivacyPipeline:
         
         logger.info("All local privacy pipeline sub-systems fully initialized.")
 
-    def process_document(self, file_source: Union[str, Path, io.BytesIO], filename: str) -> Dict[str, Any]:
+    def process_document(self, file_source: Union[str, Path, io.BytesIO], filename: str, doc_type: str = None) -> Dict[str, Any]:
         """
         Executes the end-to-end local data-cleaning processing loop.
 

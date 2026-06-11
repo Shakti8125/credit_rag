@@ -36,32 +36,32 @@ class PromptBuilder:
         )
 
     @staticmethod
-    def audit_prompt(query: str, doc_citations: List[Citation]) -> str:
+    def audit_prompt(query: str, doc_citations: List[Citation], doc_type: str = "Document") -> str:
         """
         EXTRACT: Answer from retrieved document chunks (FAISS reranked).
         """
         context_str = _format_citations(doc_citations)
         return (
             "You are an expert Credit Risk Underwriting Auditor.\n"
-            "Evaluate the provided document chunks and answer the user's query.\n"
+            f"Evaluate the provided {doc_type} and answer the user's query.\n"
             "Identify compliance gaps, flag potential credit risks, and evaluate "
             "the financial metrics presented. Be analytical and rigorous.\n\n"
-            f"DOCUMENT CHUNKS (ANONYMISED, RERANKED):\n{context_str}\n\n"
+            f"DOCUMENT CHUNKS ({doc_type.upper()} - ANONYMISED, RERANKED):\n{context_str}\n\n"
             f"USER QUERY:\n{query}"
         )
 
     @staticmethod
-    def audit_prompt_full_doc(query: str, doc_text: str) -> str:
+    def audit_prompt_full_doc(query: str, doc_text: str, doc_type: str = "Document") -> str:
         """
         EXTRACT fallback: Full document injection when FAISS is unavailable.
         DocumentInjector has already token-gated doc_text before this is called.
         """
         return (
             "You are an expert Credit Risk Underwriting Auditor.\n"
-            "Evaluate the provided internal credit memo and answer the user's query.\n"
+            f"Evaluate the provided {doc_type} and answer the user's query.\n"
             "Identify compliance gaps, flag potential credit risks, and evaluate "
             "the financial metrics presented. Be analytical and rigorous.\n\n"
-            f"INTERNAL CREDIT MEMO (ANONYMISED):\n{doc_text}\n\n"
+            f"UPLOADED DOCUMENT ({doc_type.upper()} - ANONYMISED):\n{doc_text}\n\n"
             f"USER QUERY:\n{query}"
         )
 
@@ -70,6 +70,7 @@ class PromptBuilder:
         query:         str,
         citations:     List[Citation],
         doc_citations: List[Citation],
+        doc_type:      str = "Document"
     ) -> str:
         """
         HYBRID: Synthesise retrieved document chunks with regulatory benchmarks.
@@ -78,10 +79,10 @@ class PromptBuilder:
         doc_str = _format_citations(doc_citations)
         return (
             "You are an elite Banking Risk Committee Analyst.\n"
-            "Synthesise the financial data from the internal credit memo with the "
+            f"Synthesise the financial data from the {doc_type} with the "
             "external regulatory benchmarks. Compare the applicant's profile directly "
             "against the regulatory frameworks. Identify any deviations or violations.\n\n"
             f"EXTERNAL REGULATORY BENCHMARKS:\n{reg_str}\n\n"
-            f"INTERNAL CREDIT MEMO CHUNKS (ANONYMISED):\n{doc_str}\n\n"
+            f"DOCUMENT CHUNKS ({doc_type.upper()} - ANONYMISED):\n{doc_str}\n\n"
             f"USER QUERY:\n{query}"
         )

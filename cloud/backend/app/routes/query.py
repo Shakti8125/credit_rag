@@ -58,6 +58,7 @@ class QueryRequest(BaseModel):
     intent:       str
     doc_text:     Optional[str]            = None
     masked_items: Optional[Dict[str, str]] = None   # {placeholder: original_entity}
+    doc_type:     Optional[str]            = "Document" # Added dynamically assigned doc_type
 
 
 class QueryResponse(BaseModel):
@@ -232,6 +233,7 @@ async def handle_rag_inference(payload: QueryRequest):
                     query=payload.query,
                     citations=reg_citations,
                     doc_citations=doc_citations,
+                    doc_type=payload.doc_type # Connected doc_type here
                 )
 
             elif payload.intent == "EXTRACT":
@@ -240,6 +242,7 @@ async def handle_rag_inference(payload: QueryRequest):
                     prompt_string = PromptBuilder.audit_prompt(
                         query=payload.query,
                         doc_citations=doc_citations,
+                        doc_type=payload.doc_type # Connected doc_type here
                     )
                 else:
                     execution_path = "Cloud Extraction (Full Doc Injection — FAISS unavailable)"
@@ -247,6 +250,7 @@ async def handle_rag_inference(payload: QueryRequest):
                     prompt_string  = PromptBuilder.audit_prompt_full_doc(
                         query=payload.query,
                         doc_text=safe_doc,
+                        doc_type=payload.doc_type # Connected doc_type here
                     )
 
             else:  # BENCHMARK / GENERAL

@@ -106,12 +106,15 @@ def load_reranker():
 # ---------------------------------------------------------------------------
 # UI COMPONENTS
 # ---------------------------------------------------------------------------
-from components.upload_panel   import render_upload_panel
-from components.model_toggle   import render_model_toggle
-from components.chat           import render_chat_interface
-from components.path_indicator import render_path_indicator
-from components.masking_log    import render_masking_log
-from components.citations      import render_citations
+from components.upload_panel        import render_upload_panel
+from components.model_toggle        import render_model_toggle
+from components.chat                import render_chat_interface
+from components.path_indicator      import render_path_indicator
+from components.masking_log         import render_masking_log
+from components.citations           import render_citations
+from components.financial_profile   import render_financial_profile
+from components.policy_breach_panel import render_policy_breach_panel
+from components.audit_trail         import render_audit_trail
 
 # ---------------------------------------------------------------------------
 # PAGE CONFIG
@@ -138,6 +141,10 @@ _DEFAULTS = {
     "last_uploaded_file":   None,
     "messages":             [],
     "last_execution_time":  None,
+    # Tier 1 features
+    "financial_profile":    None,   # FinancialProfile — extracted metrics
+    "breach_report":        None,   # BreachReport — policy compliance findings
+    "audit_trail":          [],     # list of AuditEntry dicts — per-session log
 }
 for key, default in _DEFAULTS.items():
     if key not in st.session_state:
@@ -210,10 +217,14 @@ def process_uploaded_document(uploaded_file) -> bool:
         return False
 
     try:
-        # ── Phase 1: Extract + mask ───────────────────────────────────
+        # Read doc_type from sidebar selection (now wired — was dead UI before)
+        doc_type = st.session_state.get("document_type", "Internal Credit Proposal (Memo)")
+
+        # ── Phase 1-3 + 4a/4b: Extract → mask → validate → financial extraction ──
         result = pipeline.process_document(
             file_source=io.BytesIO(uploaded_file.getvalue()),
             filename=uploaded_file.name,
+            doc_type=doc_type,
         )
 
         masked_entities = {
@@ -231,10 +242,27 @@ def process_uploaded_document(uploaded_file) -> bool:
         st.session_state["masked_entities"]      = masked_entities
         st.session_state["preserved_financials"] = preserved_financials
         st.session_state["last_uploaded_file"]   = uploaded_file.name
-        # Store registry so we can call unmask_text() on LLM responses
         st.session_state["registry"]             = result["registry_instance"]
 
-        # ── Phase 2: Chunk masked text ────────────────────────────────
+        # Tier 1 — store financial profile and breach report
+        st.session_state["financial_profile"] = result.get("financial_profile")
+        st.session_state["breach_report"]     = result.get("breach_report")
+
+        if result.get("financial_profile"):
+            fp = result["financial_profile"]
+            logger.info(
+                "Financial profile extracted: %d metrics found.",
+                len([k for k, v in fp.to_dict().items()
+                     if v and k not in ("doc_type", "extraction_warnings")])
+            )
+        if result.get("breach_report"):
+            br = result["breach_report"]
+            logger.info(
+                "Policy check: %d breaches, %d warnings, %d passes.",
+                br.breach_count, br.warning_count, br.pass_count,
+            )
+
+        # ── Chunk masked text ─────────────────────────────────────────
         from local.rag.chunker import MarkdownChunker
         chunker = MarkdownChunker()
         chunks  = chunker.chunk(result["masked_text"])
@@ -246,7 +274,7 @@ def process_uploaded_document(uploaded_file) -> bool:
 
         logger.info("Produced %d chunks from uploaded document.", len(chunks))
 
-        # ── Phase 3: Build ephemeral FAISS index ──────────────────────
+        # ── Build ephemeral FAISS index ───────────────────────────────
         embed_model = load_embedding_model()
         if embed_model is None:
             logger.warning("Embedding model unavailable — FAISS index skipped.")
@@ -258,9 +286,7 @@ def process_uploaded_document(uploaded_file) -> bool:
         faiss_index.build(chunks)
         st.session_state["doc_faiss_index"] = faiss_index
 
-        logger.info(
-            "Ephemeral FAISS index ready: %d vectors.", faiss_index.chunk_count
-        )
+        logger.info("Ephemeral FAISS index ready: %d vectors.", faiss_index.chunk_count)
         return True
 
     except Exception as e:
@@ -470,16 +496,24 @@ def classify_intent(prompt: str, document_attached: bool, selected_model: str) -
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.title("🏦 Credit Risk RAG")
-    uploaded_file  = render_upload_panel()
+    uploaded_file  = render_upload_panel()   # sets st.session_state["document_type"]
     selected_model = render_model_toggle()
 
     if uploaded_file and (st.session_state["last_uploaded_file"] != uploaded_file.name):
-        with st.spinner("Extracting layout, scrubbing PII, building document index…"):
+        doc_type_label = st.session_state.get("document_type", "Internal Credit Proposal (Memo)")
+        with st.spinner(f"Processing '{uploaded_file.name}' as {doc_type_label}…"):
             success = process_uploaded_document(uploaded_file)
         if success:
-            faiss_idx = st.session_state.get("doc_faiss_index")
+            faiss_idx  = st.session_state.get("doc_faiss_index")
+            breach_rpt = st.session_state.get("breach_report")
             if faiss_idx and faiss_idx.is_built:
-                st.success(f"✅ Indexed {faiss_idx.chunk_count} chunks from document.")
+                st.success(f"✅ Indexed {faiss_idx.chunk_count} chunks.")
+            if breach_rpt and breach_rpt.breach_count:
+                st.error(f"🔴 {breach_rpt.breach_count} policy breach(es) detected.")
+            elif breach_rpt and breach_rpt.warning_count:
+                st.warning(f"🟡 {breach_rpt.warning_count} policy warning(s).")
+            elif breach_rpt:
+                st.success("🟢 All policy checks passed.")
             st.rerun()
 
 # ---------------------------------------------------------------------------
@@ -498,10 +532,23 @@ with col2:
         )
 
     if st.session_state["doc_text"]:
+        # Tier 1 — proactive policy breach panel (auto-expands on breach)
+        render_policy_breach_panel(st.session_state.get("breach_report"))
+
+        # Tier 1 — structured financial profile
+        render_financial_profile(st.session_state.get("financial_profile"))
+
+        # Existing masking audit log
         render_masking_log(
             st.session_state["masked_entities"],
             st.session_state["preserved_financials"],
         )
+
+    # Tier 1 — session audit trail with PDF export
+    render_audit_trail(
+        st.session_state.get("audit_trail", []),
+        doc_filename=st.session_state.get("last_uploaded_file", "session"),
+    )
 
 with col1:
     prompt = render_chat_interface()
@@ -605,6 +652,7 @@ with col1:
                             "intent":       intent,
                             "doc_text":     doc_payload_text,   # masked chunk text only
                             "masked_items": st.session_state["masked_entities"],
+                            "doc_type":     st.session_state.get("document_type", "Document")
                         }
 
                         # Debug — visible in terminal, never in UI
@@ -641,10 +689,30 @@ with col1:
                             answer_text = f"API Error {response.status_code}: {response.text}"
                             st.error(answer_text)
 
-                    # ── TIMING + HISTORY ──────────────────────────────
+                    # ── TIMING + HISTORY + AUDIT TRAIL ───────────────
                     elapsed = round(time.time() - start_time, 2)
                     st.session_state["last_execution_time"] = elapsed
                     st.caption(f"⏱️ **Response generated in {elapsed} seconds.**")
+
+                    # Tier 1 — append to session audit trail
+                    try:
+                        from local.analysis.audit_logger import build_entry
+                        breach_report = st.session_state.get("breach_report")
+                        entry = build_entry(
+                            query          = prompt,
+                            intent         = intent,
+                            answer         = answer_text,
+                            citations      = st.session_state["last_citations"],
+                            execution_path = st.session_state["last_execution_path"],
+                            elapsed_sec    = elapsed,
+                            masked_count   = len(st.session_state.get("masked_entities", {})),
+                            doc_filename   = st.session_state.get("last_uploaded_file"),
+                            breach_summary = breach_report.summary() if breach_report else None,
+                        )
+                        st.session_state["audit_trail"].append(entry)
+                    except Exception as ae:
+                        logger.warning("Audit trail entry failed: %s", ae)
+
                     st.session_state["messages"].append({
                         "role":      "assistant",
                         "content":   answer_text,

@@ -22,3 +22,6 @@ class QueryRequest(BaseModel):
         default_factory=dict, 
         description="Dictionary of masked entities (e.g., {'{CLIENT_A}': 'John Doe'}) for tracking state."
     )
+    doc_type: Optional[str] = Field(
+        "Document",
+        description="The classification of the uploaded document")
