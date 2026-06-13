@@ -3,14 +3,10 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# ---------------------------------------------------------------------------
-# Project root on sys.path — must happen before any `from local.x` import
-# ---------------------------------------------------------------------------
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-# Load .env (Pinecone + Gemini keys) before any service import
 load_dotenv(dotenv_path=_PROJECT_ROOT / "cloud" / "backend" / ".env")
 
 import io
@@ -26,105 +22,318 @@ logger = logging.getLogger(__name__)
 # CONFIGURATION
 # ---------------------------------------------------------------------------
 API_ENDPOINT   = "http://127.0.0.1:8000/query"
+API_COMPARE    = "http://127.0.0.1:8000/compare"
+API_EWS        = "http://127.0.0.1:8000/ews"
 SLM_MODEL_PATH = r"C:\Users\Shakti\Desktop\credit-risk-rag_v_0.1\local\slm\models\phi3-basel-q4km.gguf"
 
-# Retrieval knobs
-_RERANK_POOL     = 20   # candidates fetched (bi-encoder) before cross-encoder reranking
-_PHI3_TOP_K      = 3    # final chunks fed to Phi-3 after reranking (fits 4096-token ctx)
-_FAISS_POOL      = 15   # candidates fetched from local FAISS before reranking
-_CLOUD_TOP_K     = 5    # final chunks sent to Gemini (larger ctx window)
-_CHUNK_CHAR_CAP  = 1200 # max chars per chunk in Phi-3 prompt (hard context guard)
+_RERANK_POOL    = 20
+_PHI3_TOP_K     = 3
+_FAISS_POOL     = 15
+_CLOUD_TOP_K    = 5
+_CHUNK_CHAR_CAP = 1200
 
 # ---------------------------------------------------------------------------
-# CACHED HEAVY RESOURCES — loaded once per Streamlit worker process
+# PAGE CONFIG — must be first Streamlit call
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="CreditRAG · Risk Intelligence",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ---------------------------------------------------------------------------
+# GLOBAL CSS — futuristic dark risk management theme
+# ---------------------------------------------------------------------------
+st.markdown("""
+<style>
+/* ── Base & fonts ─────────────────────────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'Inter', sans-serif;
+    background-color: #070d19;
+    color: #c8d8e8;
+}
+
+/* ── Sidebar ─────────────────────────────────────────────────── */
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0a1628 0%, #0d1f3c 100%);
+    border-right: 1px solid #1a3a5c;
+}
+[data-testid="stSidebar"] .stMarkdown h1,
+[data-testid="stSidebar"] .stMarkdown h2,
+[data-testid="stSidebar"] .stMarkdown h3 {
+    color: #4fc3f7 !important;
+}
+[data-testid="stSidebar"] label { color: #8bafc8 !important; font-size: 0.78rem !important; letter-spacing: 0.04em; text-transform: uppercase; }
+[data-testid="stSidebar"] .stSelectbox > div > div { background: #0f1e35 !important; border: 1px solid #1e3a5c !important; color: #c8d8e8 !important; border-radius: 6px; }
+[data-testid="stSidebar"] .stRadio > div { gap: 6px; }
+[data-testid="stSidebar"] .stRadio label { color: #a0c0d8 !important; font-size: 0.85rem !important; text-transform: none !important; letter-spacing: 0 !important; }
+
+/* ── Main background ─────────────────────────────────────────── */
+.main .block-container {
+    background-color: #070d19;
+    padding-top: 1.5rem;
+    max-width: 1400px;
+}
+
+/* ── Headings ────────────────────────────────────────────────── */
+h1, h2, h3 { color: #4fc3f7 !important; font-weight: 600 !important; letter-spacing: -0.01em; }
+h1 { font-size: 1.6rem !important; }
+h2 { font-size: 1.25rem !important; }
+h3 { font-size: 1.05rem !important; }
+
+/* ── Metrics ─────────────────────────────────────────────────── */
+[data-testid="stMetric"] {
+    background: linear-gradient(135deg, #0d1f3c 0%, #0f2540 100%);
+    border: 1px solid #1e3a5c;
+    border-radius: 10px;
+    padding: 14px 18px;
+}
+[data-testid="stMetricLabel"] { color: #7ca8c8 !important; font-size: 0.72rem !important; text-transform: uppercase; letter-spacing: 0.08em; }
+[data-testid="stMetricValue"] { color: #4fc3f7 !important; font-size: 1.5rem !important; font-weight: 700 !important; font-family: 'JetBrains Mono', monospace !important; }
+
+/* ── Expanders ───────────────────────────────────────────────── */
+[data-testid="stExpander"] {
+    background: #0a1628 !important;
+    border: 1px solid #1a3355 !important;
+    border-radius: 10px !important;
+    margin-bottom: 8px !important;
+}
+[data-testid="stExpander"] summary {
+    color: #90caf9 !important;
+    font-weight: 500 !important;
+    font-size: 0.88rem !important;
+}
+
+/* ── Alerts ──────────────────────────────────────────────────── */
+[data-testid="stAlert"] { border-radius: 8px !important; border-left-width: 4px !important; }
+div[data-baseweb="notification"][kind="error"]   { background: #1a0a0a !important; border-color: #ef5350 !important; }
+div[data-baseweb="notification"][kind="warning"] { background: #1a1400 !important; border-color: #ffb74d !important; }
+div[data-baseweb="notification"][kind="success"] { background: #071a0e !important; border-color: #66bb6a !important; }
+div[data-baseweb="notification"][kind="info"]    { background: #051428 !important; border-color: #4fc3f7 !important; }
+
+/* ── Code / inline code ──────────────────────────────────────── */
+code {
+    background: #0f2236 !important;
+    color: #80d8ff !important;
+    border: 1px solid #1a3a5c !important;
+    border-radius: 4px !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.82em !important;
+    padding: 1px 5px !important;
+}
+
+/* ── Buttons ─────────────────────────────────────────────────── */
+.stButton > button {
+    background: linear-gradient(135deg, #0d47a1 0%, #1565c0 100%) !important;
+    color: #e3f2fd !important;
+    border: 1px solid #1976d2 !important;
+    border-radius: 8px !important;
+    font-weight: 500 !important;
+    letter-spacing: 0.02em !important;
+    transition: all 0.2s ease !important;
+}
+.stButton > button:hover {
+    background: linear-gradient(135deg, #1565c0 0%, #1976d2 100%) !important;
+    box-shadow: 0 0 16px rgba(79,195,247,0.25) !important;
+    transform: translateY(-1px) !important;
+}
+.stDownloadButton > button {
+    background: linear-gradient(135deg, #004d40 0%, #00695c 100%) !important;
+    color: #e0f2f1 !important;
+    border: 1px solid #00897b !important;
+    border-radius: 8px !important;
+}
+
+/* ── Chat messages ───────────────────────────────────────────── */
+[data-testid="stChatMessage"] {
+    background: #0a1628 !important;
+    border: 1px solid #1a3355 !important;
+    border-radius: 12px !important;
+    margin-bottom: 8px !important;
+}
+[data-testid="stChatMessageContent"] { color: #c8d8e8 !important; }
+
+/* ── Chat input ──────────────────────────────────────────────── */
+[data-testid="stChatInput"] > div {
+    background: #0d1f3c !important;
+    border: 1px solid #1e3a5c !important;
+    border-radius: 12px !important;
+}
+[data-testid="stChatInput"] textarea {
+    color: #c8d8e8 !important;
+    background: transparent !important;
+}
+[data-testid="stChatInput"] textarea::placeholder { color: #4a6a88 !important; }
+
+/* ── File uploader ───────────────────────────────────────────── */
+[data-testid="stFileUploader"] {
+    background: #0a1628 !important;
+    border: 1px dashed #1e3a5c !important;
+    border-radius: 10px !important;
+    padding: 8px !important;
+}
+[data-testid="stFileUploader"] label { color: #7ca8c8 !important; }
+
+/* ── Dividers ────────────────────────────────────────────────── */
+hr { border-color: #1a3355 !important; }
+
+/* ── Spinner ─────────────────────────────────────────────────── */
+[data-testid="stSpinner"] > div { border-top-color: #4fc3f7 !important; }
+
+/* ── Caption ─────────────────────────────────────────────────── */
+.stCaption, [data-testid="stCaptionContainer"] { color: #5a8aaa !important; font-size: 0.78rem !important; }
+
+/* ── Scrollbar ───────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #070d19; }
+::-webkit-scrollbar-thumb { background: #1e3a5c; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #2a5080; }
+
+/* ── Status badge pill ───────────────────────────────────────── */
+.status-pill {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 20px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+.pill-active { background: #0a3320; color: #66bb6a; border: 1px solid #2e7d32; }
+.pill-idle   { background: #1a1a2e; color: #7986cb; border: 1px solid #3949ab; }
+.pill-warn   { background: #1a0f00; color: #ffb74d; border: 1px solid #e65100; }
+.pill-breach { background: #1a0505; color: #ef5350; border: 1px solid #b71c1c; }
+
+/* ── Header banner ───────────────────────────────────────────── */
+.header-banner {
+    background: linear-gradient(90deg, #071428 0%, #0d2040 50%, #071428 100%);
+    border: 1px solid #1a3a5c;
+    border-radius: 12px;
+    padding: 16px 24px;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+.header-title {
+    font-size: 1.3rem;
+    font-weight: 700;
+    color: #4fc3f7;
+    letter-spacing: -0.02em;
+}
+.header-sub {
+    font-size: 0.75rem;
+    color: #4a7a9b;
+    margin-top: 2px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+}
+.header-badge {
+    font-size: 0.7rem;
+    color: #4fc3f7;
+    border: 1px solid #1a5276;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-family: 'JetBrains Mono', monospace;
+}
+
+/* ── Intent badge ────────────────────────────────────────────── */
+.intent-chip {
+    display: inline-block;
+    padding: 3px 12px;
+    border-radius: 20px;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-left: 8px;
+    vertical-align: middle;
+}
+.chip-extract   { background: #0a2040; color: #64b5f6; border: 1px solid #1565c0; }
+.chip-hybrid    { background: #1a0a30; color: #ce93d8; border: 1px solid #7b1fa2; }
+.chip-general   { background: #0a1a10; color: #81c784; border: 1px solid #2e7d32; }
+.chip-benchmark { background: #1a1000; color: #ffcc02; border: 1px solid #f57f17; }
+.chip-compare   { background: #001a1a; color: #4dd0e1; border: 1px solid #00838f; }
+.chip-ews       { background: #1a0a0a; color: #ef9a9a; border: 1px solid #c62828; }
+
+/* ── Panel section header ────────────────────────────────────── */
+.panel-section {
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: #3a6a8a;
+    margin: 16px 0 6px 0;
+    padding-bottom: 4px;
+    border-bottom: 1px solid #0f2236;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# CACHED RESOURCES
 # ---------------------------------------------------------------------------
 
-@st.cache_resource(show_spinner="Initialising privacy pipeline (Docling + spaCy)…")
+@st.cache_resource(show_spinner="Initialising privacy pipeline…")
 def load_privacy_pipeline():
     from local.privacy.pipeline import PrivacyPipeline
     return PrivacyPipeline(spacy_model="en_core_web_lg")
 
 
-@st.cache_resource(show_spinner="Loading local Phi-3 GGUF weights…")
+@st.cache_resource(show_spinner="Loading Phi-3 GGUF…")
 def load_inference_engine():
     try:
         from local.slm.inference import LocalModelInference
         return LocalModelInference(model_path=SLM_MODEL_PATH, ctx_size=4096, gpu_layers=0)
-    except FileNotFoundError:
-        logger.info("Phi-3 GGUF not found at %s — Local Edge path disabled.", SLM_MODEL_PATH)
-        return None
-    except ImportError:
-        logger.info("llama-cpp-python not installed — Local Edge path disabled.")
+    except (FileNotFoundError, ImportError) as e:
+        logger.info("Local inference unavailable: %s", e)
         return None
 
 
-@st.cache_resource(show_spinner="Loading sentence-transformer embedding model…")
+@st.cache_resource(show_spinner="Loading embedding model…")
 def load_embedding_model():
-    """
-    Loads all-MiniLM-L6-v2 once per worker (~80 MB).
-    Used to build the ephemeral FAISS index over uploaded document chunks.
-    """
     try:
         from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer("all-MiniLM-L6-v2")
-        logger.info("Embedding model loaded: all-MiniLM-L6-v2")
-        return model
+        return SentenceTransformer("all-MiniLM-L6-v2")
     except ImportError:
-        logger.warning("sentence-transformers not installed — local FAISS RAG disabled.")
         return None
 
 
-@st.cache_resource(show_spinner="Connecting to Pinecone (regulatory corpus)…")
+@st.cache_resource(show_spinner="Connecting to Pinecone…")
 def load_pinecone_retriever():
-    """
-    Connects to the shared Pinecone index that holds the pre-loaded regulatory
-    corpus (CBUAE, Basel III, IFRS-9, etc.).
-    Used for GENERAL and HYBRID intents on the local Phi-3 path.
-    """
     try:
         from local.rag.pinecone_index import PineconeRetriever
         return PineconeRetriever()
     except Exception as e:
-        logger.warning("PineconeRetriever unavailable: %s", e)
+        logger.warning("PineconeRetriever: %s", e)
         return None
 
 
-@st.cache_resource(show_spinner="Loading cross-encoder reranker…")
+@st.cache_resource(show_spinner="Loading cross-encoder…")
 def load_reranker():
-    """
-    Loads cross-encoder/ms-marco-MiniLM-L-6-v2 once per worker.
-    Used to rerank both FAISS (doc) and Pinecone (regulatory) recall pools.
-    """
     try:
         from local.rag.reranker import CrossEncoderReranker
         return CrossEncoderReranker()
     except Exception as e:
-        logger.warning("CrossEncoderReranker unavailable: %s", e)
+        logger.warning("CrossEncoderReranker: %s", e)
         return None
 
 
 # ---------------------------------------------------------------------------
-# UI COMPONENTS
+# COMPONENT IMPORTS
 # ---------------------------------------------------------------------------
 from components.upload_panel        import render_upload_panel
 from components.model_toggle        import render_model_toggle
 from components.chat                import render_chat_interface
-from components.path_indicator      import render_path_indicator
 from components.masking_log         import render_masking_log
 from components.citations           import render_citations
 from components.financial_profile   import render_financial_profile
 from components.policy_breach_panel import render_policy_breach_panel
 from components.audit_trail         import render_audit_trail
-
-# ---------------------------------------------------------------------------
-# PAGE CONFIG
-# ---------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Credit Risk RAG",
-    page_icon="🏦",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
 
 # ---------------------------------------------------------------------------
 # SESSION STATE
@@ -133,22 +342,27 @@ _DEFAULTS = {
     "last_execution_path":  "Idle",
     "last_citations":       [],
     "last_intent":          "GENERAL",
-    "masked_entities":      {},     # {placeholder: original_entity}  — for masking_log UI
+    "masked_entities":      {},
     "preserved_financials": [],
-    "doc_text":             None,   # masked Markdown — sent to cloud path
-    "doc_faiss_index":      None,   # LocalDocumentIndex built from uploaded doc
-    "registry":             None,   # EntityRegistry instance — for unmask_text()
-    "last_uploaded_file":   None,
+    "doc_text":             None,
+    "doc_faiss_index":      None,
+    "registry":             None,
+    "last_uploaded_file":   None,   # NOTE: initialised to None, not "session"
     "messages":             [],
     "last_execution_time":  None,
-    # Tier 1 features
-    "financial_profile":    None,   # FinancialProfile — extracted metrics
-    "breach_report":        None,   # BreachReport — policy compliance findings
-    "audit_trail":          [],     # list of AuditEntry dicts — per-session log
+    "financial_profile":    None,
+    "breach_report":        None,
+    "audit_trail":          [],
+    "analysis_mode":        "Standard",
+    "doc_b_text":           None,
+    "doc_b_label":          None,
+    "doc_b_faiss_index":    None,
+    "ews_report":           None,
+    "ews_cloud_result":     None,
 }
-for key, default in _DEFAULTS.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
+for k, v in _DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 
 # ---------------------------------------------------------------------------
@@ -175,229 +389,165 @@ def _extract_preserved_financials(masked_text: str) -> list:
     found = set()
     for pattern in patterns:
         for match in pattern.finditer(masked_text):
-            value = match.group().strip()
-            if len(value) > 1:
-                found.add(value)
+            val = match.group().strip()
+            if len(val) > 1:
+                found.add(val)
     return sorted(found)
 
 
 def _unmask_response(text: str) -> str:
-    """
-    Replaces placeholder tokens ([ORG_1], [PERSON_2] …) with original entity
-    names so the user never sees raw masked tokens in the UI.
-
-    Prefers EntityRegistry.unmask_text() which guarantees longest-key-first
-    replacement order. Falls back to the flat dict if registry is not available.
-    """
+    """Unmask STRICTLY after LLM generation — never before."""
     registry = st.session_state.get("registry")
     if registry is not None:
         return registry.unmask_text(text)
-    # Flat-dict fallback — sort by key length descending to avoid partial hits
     mapping = st.session_state.get("masked_entities", {})
-    for placeholder in sorted(mapping.keys(), key=len, reverse=True):
-        text = text.replace(placeholder, mapping[placeholder])
+    for ph in sorted(mapping.keys(), key=len, reverse=True):
+        text = text.replace(ph, mapping[ph])
     return text
 
 
-def process_uploaded_document(uploaded_file) -> bool:
-    """
-    Full document processing pipeline:
-      1. Docling extraction → masked Markdown (PrivacyPipeline)
-      2. EntityRegistry stored in session for response unmasking
-      3. MarkdownChunker → chunks
-      4. LocalDocumentIndex (FAISS) built from chunks — ephemeral, in-memory
+def _intent_chip(intent: str) -> str:
+    classes = {
+        "EXTRACT": "chip-extract", "HYBRID": "chip-hybrid",
+        "GENERAL": "chip-general", "BENCHMARK": "chip-benchmark",
+        "COMPARE": "chip-compare", "EWS": "chip-ews",
+    }
+    cls = classes.get(intent, "chip-general")
+    return f'<span class="intent-chip {cls}">{intent}</span>'
 
-    The FAISS index is stored as st.session_state["doc_faiss_index"].
-    It is discarded automatically when a new document is uploaded or the
-    browser session ends — no disk writes, no network calls.
-    """
+
+def process_uploaded_document(uploaded_file, slot: str = "primary") -> bool:
     pipeline = load_privacy_pipeline()
     if pipeline is None:
-        st.error("🚨 Privacy pipeline failed to initialise. Check logs.")
+        st.error("🚨 Privacy pipeline failed to initialise.")
         return False
 
-    try:
-        # Read doc_type from sidebar selection (now wired — was dead UI before)
-        doc_type = st.session_state.get("document_type", "Internal Credit Proposal (Memo)")
+    doc_type = st.session_state.get("document_type", "Internal Credit Proposal (Memo)")
 
-        # ── Phase 1-3 + 4a/4b: Extract → mask → validate → financial extraction ──
+    try:
         result = pipeline.process_document(
             file_source=io.BytesIO(uploaded_file.getvalue()),
             filename=uploaded_file.name,
             doc_type=doc_type,
         )
 
-        masked_entities = {
-            entry["placeholder"]: entry["original_entity"]
-            for entry in result["audit_log"]
-        }
+        masked_entities      = {e["placeholder"]: e["original_entity"] for e in result["audit_log"]}
         preserved_financials = _extract_preserved_financials(result["masked_text"])
 
+        if slot == "primary":
+            st.session_state["doc_text"]             = result["masked_text"]
+            st.session_state["masked_entities"]      = masked_entities
+            st.session_state["preserved_financials"] = preserved_financials
+            st.session_state["last_uploaded_file"]   = uploaded_file.name
+            st.session_state["registry"]             = result["registry_instance"]
+            st.session_state["financial_profile"]    = result.get("financial_profile")
+            st.session_state["breach_report"]        = result.get("breach_report")
+            st.session_state["ews_report"]           = result.get("ews_report")
+            st.session_state["ews_cloud_result"]     = None
+
+            embed_model = load_embedding_model()
+            if embed_model:
+                from local.rag.chunker     import MarkdownChunker
+                from local.rag.local_index import LocalDocumentIndex
+                chunks = MarkdownChunker().chunk(result["masked_text"])
+                if chunks:
+                    idx = LocalDocumentIndex(embed_model)
+                    idx.build(chunks)
+                    st.session_state["doc_faiss_index"] = idx
+        else:
+            st.session_state["doc_b_text"]  = result["masked_text"]
+            st.session_state["doc_b_label"] = uploaded_file.name
+            embed_model = load_embedding_model()
+            if embed_model:
+                from local.rag.chunker     import MarkdownChunker
+                from local.rag.local_index import LocalDocumentIndex
+                chunks = MarkdownChunker().chunk(result["masked_text"])
+                if chunks:
+                    idx = LocalDocumentIndex(embed_model)
+                    idx.build(chunks)
+                    st.session_state["doc_b_faiss_index"] = idx
+
         logger.info(
-            "Document processed: %d entities masked, %d financials preserved.",
-            len(masked_entities), len(preserved_financials),
+            "Doc processed [%s]: %d entities masked, %d financials",
+            slot, len(masked_entities), len(preserved_financials),
         )
-
-        st.session_state["doc_text"]             = result["masked_text"]
-        st.session_state["masked_entities"]      = masked_entities
-        st.session_state["preserved_financials"] = preserved_financials
-        st.session_state["last_uploaded_file"]   = uploaded_file.name
-        st.session_state["registry"]             = result["registry_instance"]
-
-        # Tier 1 — store financial profile and breach report
-        st.session_state["financial_profile"] = result.get("financial_profile")
-        st.session_state["breach_report"]     = result.get("breach_report")
-
-        if result.get("financial_profile"):
-            fp = result["financial_profile"]
-            logger.info(
-                "Financial profile extracted: %d metrics found.",
-                len([k for k, v in fp.to_dict().items()
-                     if v and k not in ("doc_type", "extraction_warnings")])
-            )
-        if result.get("breach_report"):
-            br = result["breach_report"]
-            logger.info(
-                "Policy check: %d breaches, %d warnings, %d passes.",
-                br.breach_count, br.warning_count, br.pass_count,
-            )
-
-        # ── Chunk masked text ─────────────────────────────────────────
-        from local.rag.chunker import MarkdownChunker
-        chunker = MarkdownChunker()
-        chunks  = chunker.chunk(result["masked_text"])
-
-        if not chunks:
-            logger.warning("Chunker produced 0 chunks — FAISS index will not be built.")
-            st.session_state["doc_faiss_index"] = None
-            return True
-
-        logger.info("Produced %d chunks from uploaded document.", len(chunks))
-
-        # ── Build ephemeral FAISS index ───────────────────────────────
-        embed_model = load_embedding_model()
-        if embed_model is None:
-            logger.warning("Embedding model unavailable — FAISS index skipped.")
-            st.session_state["doc_faiss_index"] = None
-            return True
-
-        from local.rag.local_index import LocalDocumentIndex
-        faiss_index = LocalDocumentIndex(embed_model)
-        faiss_index.build(chunks)
-        st.session_state["doc_faiss_index"] = faiss_index
-
-        logger.info("Ephemeral FAISS index ready: %d vectors.", faiss_index.chunk_count)
         return True
 
     except Exception as e:
         from local.privacy.validator import LeakageValidationError
         if isinstance(e, LeakageValidationError):
-            st.error(f"🚨 Egress firewall blocked transmission: {e}")
+            st.error(f"🚨 Egress firewall blocked: {e}")
         else:
             st.error(f"🚨 Document processing failed: {e}")
-        logger.error("Pipeline error for %s: %s", uploaded_file.name, e, exc_info=True)
+        logger.error("Pipeline error [%s] %s: %s", slot, uploaded_file.name, e, exc_info=True)
         return False
 
 
 # ---------------------------------------------------------------------------
-# RETRIEVAL  — intent-aware, cross-encoder reranked
+# RETRIEVAL
 # ---------------------------------------------------------------------------
 
-def _retrieve_doc_chunks(query: str, top_k: int = _PHI3_TOP_K, for_cloud: bool = False) -> tuple:
-    """
-    Retrieves top-k chunks from the UPLOADED DOCUMENT via the ephemeral
-    FAISS index, reranked by the cross-encoder.
-
-    Parameters
-    ----------
-    query     : user question
-    top_k     : final chunks after reranking
-    for_cloud : if True, use _CLOUD_TOP_K and return plain chunk text
-                (no Phi-3 system prompt wrapper) suitable for FastAPI payload.
-
-    Returns (context_block_or_raw_chunks: str, citations: list[dict])
-    """
+def _retrieve_doc_chunks(query: str, top_k: int = _PHI3_TOP_K,
+                          for_cloud: bool = False,
+                          faiss_key: str = "doc_faiss_index") -> tuple:
     effective_top_k = _CLOUD_TOP_K if for_cloud else top_k
-
-    faiss_index = st.session_state.get("doc_faiss_index")
-    reranker    = load_reranker()
+    faiss_index     = st.session_state.get(faiss_key)
+    reranker        = load_reranker()
 
     if faiss_index is None or not faiss_index.is_built:
-        logger.warning("FAISS index not available — falling back to keyword extraction.")
         return _keyword_fallback(query)
 
-    # Bi-encoder recall
     pool = faiss_index.search(query, top_k=_FAISS_POOL)
 
-    # Cross-encoder rerank
     if reranker is not None and len(pool) > 1:
         ranked = reranker.rerank(query, pool, top_k=effective_top_k)
     else:
-        ranked = [(chunk, score) for chunk, score in pool[:effective_top_k]]
+        ranked = [(c, s) for c, s in pool[:effective_top_k]]
 
     if not ranked:
         return _keyword_fallback(query)
 
-    chunk_texts = []
-    citations   = []
+    chunk_texts, citations = [], []
     for i, (chunk, score) in enumerate(ranked, 1):
         header = f"[Section: {chunk.section}] " if chunk.section else ""
-        # Hard cap per chunk for Phi-3 context budget
-        text = chunk.text if for_cloud else chunk.text[:_CHUNK_CHAR_CAP]
+        text   = chunk.text if for_cloud else chunk.text[:_CHUNK_CHAR_CAP]
         chunk_texts.append(f"Chunk {i} {header}(score {score:.3f}):\n{text}")
         citations.append({
             "section": chunk.section or "Document",
-            "text":    chunk.text,   # always store full text in citations
+            "text":    chunk.text,
             "score":   round(score, 3),
             "page":    f"Chunk {chunk.index + 1} of {faiss_index.chunk_count}",
         })
 
     context = "\n\n---\n\n".join(chunk_texts)
-
     if for_cloud:
-        # Raw chunk text — PromptBuilder in query.py will wrap this
         return context, citations
 
-    # Phi-3 formatted context block
-    context_block = (
+    return (
         "System: You are a credit risk analyst. "
-        "Answer the question using ONLY the document chunks below. "
-        "Be concise — 3-4 sentences. "
-        "If the answer is not in the chunks, say so.\n\n"
-        f"Document Chunks (top-{effective_top_k}, cross-encoder reranked):\n\n{context}\n\n"
-    )
-    return context_block, citations
+        "Answer using ONLY the chunks below. Be concise — 3-4 sentences.\n\n"
+        f"Document Chunks (top-{effective_top_k}, reranked):\n\n{context}\n\n"
+    ), citations
 
 
 def _retrieve_regulatory_chunks(query: str, top_k: int = _PHI3_TOP_K) -> tuple:
-    """
-    Retrieves top-k chunks from the REGULATORY CORPUS (Pinecone) reranked
-    by the cross-encoder.
-
-    Returns (context_block: str, citations: list[dict])
-    Used for GENERAL intent (and the regulatory half of HYBRID).
-    """
     pinecone = load_pinecone_retriever()
     reranker = load_reranker()
 
     if pinecone is None:
-        logger.warning("Pinecone unavailable — no regulatory context.")
         return "", []
 
-    # Bi-encoder recall
     pool = pinecone.search(query, top_k=_RERANK_POOL)
 
-    # Cross-encoder rerank
     if reranker is not None and len(pool) > 1:
         ranked = reranker.rerank(query, pool, top_k=top_k)
     else:
-        ranked = [(chunk, 0.0) for chunk in pool[:top_k]]
+        ranked = [(c, 0.0) for c in pool[:top_k]]
 
     if not ranked:
         return "", []
 
-    chunk_texts = []
-    citations   = []
+    chunk_texts, citations = [], []
     for i, (chunk, score) in enumerate(ranked, 1):
         header = f"[{chunk.section}] " if chunk.section else ""
         chunk_texts.append(f"Chunk {i} {header}(score {score:.3f}):\n{chunk.text}")
@@ -409,40 +559,31 @@ def _retrieve_regulatory_chunks(query: str, top_k: int = _PHI3_TOP_K) -> tuple:
         })
 
     context = "\n\n---\n\n".join(chunk_texts)
-    context_block = (
-        f"Regulatory Chunks (top-{top_k}, cross-encoder reranked):\n\n{context}\n\n"
-    )
-    return context_block, citations
+    return f"Regulatory Chunks (top-{top_k}, reranked):\n\n{context}\n\n", citations
 
 
 def _keyword_fallback(query: str) -> tuple:
-    """
-    Keyword-based extraction from doc_text when FAISS is unavailable.
-    Returns (context_block, []) — no citations for fallback.
-    """
     doc_text   = st.session_state.get("doc_text") or ""
     paragraphs = [p.strip() for p in doc_text.split("\n\n") if p.strip()]
-    STOP = {"what", "is", "the", "a", "an", "of", "in", "this", "about",
-            "are", "how", "does", "do", "which", "can", "be", "to", "and"}
-    keywords = {w.lower() for w in query.split() if w.lower() not in STOP and len(w) > 2}
-    scored = sorted(
+    STOP       = {"what","is","the","a","an","of","in","this","about","are",
+                  "how","does","do","which","can","be","to","and"}
+    keywords   = {w.lower() for w in query.split() if w.lower() not in STOP and len(w) > 2}
+    scored     = sorted(
         paragraphs,
         key=lambda p: len(keywords & {w.lower().strip(".,;:()[]") for w in p.split()}),
         reverse=True,
     )
-    excerpt_words: list = []
+    words: list = []
     for para in scored:
-        words = para.split()
-        if len(excerpt_words) + len(words) > 500:
+        ws = para.split()
+        if len(words) + len(ws) > 500:
             break
-        excerpt_words.extend(words)
-    excerpt = " ".join(excerpt_words) if excerpt_words else " ".join(doc_text.split()[:500])
-    context_block = (
-        "System: You are a credit risk analyst. "
-        "Answer based on the document excerpt below. Be concise (3-4 sentences).\n\n"
-        f"Document Excerpt:\n{excerpt}\n\n"
-    )
-    return context_block, []
+        words.extend(ws)
+    excerpt = " ".join(words) if words else " ".join(doc_text.split()[:500])
+    return (
+        "System: You are a credit risk analyst. Answer based on the excerpt below. "
+        "Be concise.\n\nDocument Excerpt:\n" + excerpt + "\n\n"
+    ), []
 
 
 # ---------------------------------------------------------------------------
@@ -450,44 +591,32 @@ def _keyword_fallback(query: str) -> tuple:
 # ---------------------------------------------------------------------------
 
 def classify_intent(prompt: str, document_attached: bool, selected_model: str) -> str:
-    """
-    Deterministic keyword-based intent classifier.
+    mode = st.session_state.get("analysis_mode", "Standard")
+    if mode == "Compare Two Documents":
+        return "COMPARE"
+    if mode == "Early Warning Scan":
+        return "EWS"
 
-    Intents:
-      EXTRACT   — answer lives entirely in the uploaded document
-      HYBRID    — needs uploaded doc + regulatory corpus
-      BENCHMARK — no doc; pure regulatory knowledge retrieval
-      GENERAL   — no doc; conversational / domain knowledge
-    """
     if selected_model == "Phi-3 (Local Edge)":
         if not document_attached:
             return "GENERAL"
         HYBRID_SIGNALS = {
-            "compare", "comparison", "versus", "vs", "against", "relative",
-            "benchmark", "benchmarking", "exceed", "below", "above", "breach",
-            "guideline", "guidelines", "policy", "policies", "requirement",
-            "requirements", "comply", "compliant", "compliance", "threshold",
-            "limit", "limits", "minimum", "maximum", "meet", "meets", "satisfy",
-            "cbuae", "basel", "rbi", "ifrs", "ifrs9", "sr11-7", "eba", "bcbs",
+            "compare","versus","vs","benchmark","exceed","below","above","breach",
+            "guideline","policy","requirement","comply","compliance","threshold",
+            "limit","minimum","maximum","cbuae","basel","rbi","ifrs","eba","bcbs",
         }
-        query_tokens = set(prompt.lower().split())
-        return "HYBRID" if query_tokens & HYBRID_SIGNALS else "EXTRACT"
+        return "HYBRID" if set(prompt.lower().split()) & HYBRID_SIGNALS else "EXTRACT"
 
-    # Gemini Pro path
     if not document_attached:
         return "BENCHMARK"
 
     HYBRID_SIGNALS = {
-        "compare", "comparison", "versus", "vs", "against", "relative",
-        "benchmark", "benchmarking", "exceed", "below", "above", "breach",
-        "guideline", "guidelines", "policy", "policies", "requirement",
-        "requirements", "comply", "compliant", "compliance", "threshold",
-        "limit", "limits", "minimum", "maximum", "meet", "meets", "satisfy",
-        "cbuae", "basel", "rbi", "ifrs", "ifrs9", "sr11-7", "eba", "bcbs",
+        "compare","versus","vs","benchmark","exceed","below","above","breach",
+        "guideline","policy","requirement","comply","compliance","threshold",
+        "limit","minimum","maximum","cbuae","basel","rbi","ifrs","eba","bcbs",
     }
-    query_tokens = set(prompt.lower().split())
-    intent = "HYBRID" if query_tokens & HYBRID_SIGNALS else "EXTRACT"
-    logger.info("Intent='%s' (doc=%s model=%s)", intent, document_attached, selected_model)
+    intent = "HYBRID" if set(prompt.lower().split()) & HYBRID_SIGNALS else "EXTRACT"
+    logger.info("Intent='%s' doc=%s model=%s", intent, document_attached, selected_model)
     return intent
 
 
@@ -495,154 +624,348 @@ def classify_intent(prompt: str, document_attached: bool, selected_model: str) -
 # SIDEBAR
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.title("🏦 Credit Risk RAG")
-    uploaded_file  = render_upload_panel()   # sets st.session_state["document_type"]
-    selected_model = render_model_toggle()
+    # Brand mark
+    st.markdown("""
+    <div style="padding: 12px 0 20px 0;">
+        <div style="font-size:1.2rem;font-weight:700;color:#4fc3f7;letter-spacing:-0.02em;">
+            🛡️ CreditRAG
+        </div>
+        <div style="font-size:0.65rem;color:#3a6a8a;text-transform:uppercase;letter-spacing:0.12em;margin-top:2px;">
+            Risk Intelligence Platform
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    if uploaded_file and (st.session_state["last_uploaded_file"] != uploaded_file.name):
-        doc_type_label = st.session_state.get("document_type", "Internal Credit Proposal (Memo)")
-        with st.spinner(f"Processing '{uploaded_file.name}' as {doc_type_label}…"):
-            success = process_uploaded_document(uploaded_file)
-        if success:
-            faiss_idx  = st.session_state.get("doc_faiss_index")
-            breach_rpt = st.session_state.get("breach_report")
-            if faiss_idx and faiss_idx.is_built:
-                st.success(f"✅ Indexed {faiss_idx.chunk_count} chunks.")
-            if breach_rpt and breach_rpt.breach_count:
-                st.error(f"🔴 {breach_rpt.breach_count} policy breach(es) detected.")
-            elif breach_rpt and breach_rpt.warning_count:
-                st.warning(f"🟡 {breach_rpt.warning_count} policy warning(s).")
-            elif breach_rpt:
-                st.success("🟢 All policy checks passed.")
+    primary_file, secondary_file = render_upload_panel()
+    selected_model               = render_model_toggle()
+
+    # Privacy status
+    st.markdown('<div class="panel-section">Security Status</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="background:#071a0e;border:1px solid #1b5e20;border-radius:8px;padding:10px 14px;">
+        <div style="font-size:0.72rem;font-weight:600;color:#66bb6a;text-transform:uppercase;letter-spacing:0.08em;">
+            🔒 Local Anonymisation Active
+        </div>
+        <div style="font-size:0.7rem;color:#388e3c;margin-top:4px;line-height:1.5;">
+            All PII masked on-device before cloud dispatch.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    mode = st.session_state.get("analysis_mode", "Standard")
+
+    # Process primary document
+    if primary_file and st.session_state["last_uploaded_file"] != primary_file.name:
+        with st.spinner(f"Processing {primary_file.name}…"):
+            ok = process_uploaded_document(primary_file, slot="primary")
+        if ok:
+            idx    = st.session_state.get("doc_faiss_index")
+            breach = st.session_state.get("breach_report")
+            if idx and idx.is_built:
+                st.success(f"✅ {idx.chunk_count} chunks indexed")
+            if breach:
+                if breach.breach_count:
+                    st.error(f"🔴 {breach.breach_count} policy breach(es)")
+                elif breach.warning_count:
+                    st.warning(f"🟡 {breach.warning_count} warning(s)")
+                else:
+                    st.success("🟢 All policy checks passed")
             st.rerun()
+
+    # Process secondary document (Compare mode)
+    if (
+        mode == "Compare Two Documents"
+        and secondary_file
+        and st.session_state.get("doc_b_label") != secondary_file.name
+    ):
+        with st.spinner(f"Processing {secondary_file.name}…"):
+            ok = process_uploaded_document(secondary_file, slot="secondary")
+        if ok:
+            idx = st.session_state.get("doc_b_faiss_index")
+            if idx and idx.is_built:
+                st.success(f"✅ Doc B: {idx.chunk_count} chunks")
+            st.rerun()
+
 
 # ---------------------------------------------------------------------------
 # MAIN LAYOUT
 # ---------------------------------------------------------------------------
-col1, col2 = st.columns([2, 1])
 
+# Header banner
+doc_name  = st.session_state.get("last_uploaded_file") or "No document loaded"
+mode_disp = st.session_state.get("analysis_mode", "Standard")
+st.markdown(f"""
+<div class="header-banner">
+    <div>
+        <div class="header-title">Risk Intelligence Terminal</div>
+        <div class="header-sub">Credit Risk RAG · Regulatory Intelligence · Policy Compliance</div>
+    </div>
+    <div style="text-align:right;">
+        <div class="header-badge">📄 {doc_name}</div>
+        <div style="font-size:0.65rem;color:#3a6a8a;margin-top:4px;text-transform:uppercase;letter-spacing:0.08em;">
+            Mode: {mode_disp}
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+col1, col2 = st.columns([2, 1], gap="medium")
+
+# ── RIGHT PANEL ───────────────────────────────────────────────────────────
 with col2:
-    render_path_indicator(st.session_state["last_execution_path"])
 
-    if st.session_state["last_execution_time"]:
-        st.metric(
-            label="⏱️ Inference Latency",
-            value=f"{st.session_state['last_execution_time']} sec",
-            help="Total time from query submission to rendered response.",
+    # Execution status
+    path = st.session_state["last_execution_path"]
+    if path == "Idle":
+        pill_cls, pill_lbl = "pill-idle", "● IDLE"
+    elif "Local" in path:
+        pill_cls, pill_lbl = "pill-active", "● LOCAL EDGE"
+    else:
+        pill_cls, pill_lbl = "pill-active", "● CLOUD ACTIVE"
+
+    col_path, col_lat = st.columns([2, 1])
+    with col_path:
+        st.markdown(
+            f'<div class="panel-section">Execution Path</div>'
+            f'<span class="status-pill {pill_cls}">{pill_lbl}</span>'
+            f'<div style="font-size:0.72rem;color:#4a7a9b;margin-top:6px;">{path}</div>',
+            unsafe_allow_html=True,
         )
+    with col_lat:
+        if st.session_state["last_execution_time"]:
+            st.metric("⏱ Latency", f"{st.session_state['last_execution_time']}s")
+
+    st.markdown("---")
 
     if st.session_state["doc_text"]:
-        # Tier 1 — proactive policy breach panel (auto-expands on breach)
+        st.markdown('<div class="panel-section">Policy & Risk Signals</div>', unsafe_allow_html=True)
         render_policy_breach_panel(st.session_state.get("breach_report"))
-
-        # Tier 1 — structured financial profile
         render_financial_profile(st.session_state.get("financial_profile"))
 
-        # Existing masking audit log
+        st.markdown('<div class="panel-section">Privacy Audit</div>', unsafe_allow_html=True)
         render_masking_log(
             st.session_state["masked_entities"],
             st.session_state["preserved_financials"],
         )
 
-    # Tier 1 — session audit trail with PDF export
+    st.markdown('<div class="panel-section">Session Audit Trail</div>', unsafe_allow_html=True)
+    # FIX: use `or "session"` to guard None value — .get() default only applies
+    # when the key is absent, not when it holds None
+    safe_doc_name = st.session_state.get("last_uploaded_file") or "session"
     render_audit_trail(
         st.session_state.get("audit_trail", []),
-        doc_filename=st.session_state.get("last_uploaded_file", "session"),
+        doc_filename=safe_doc_name,
     )
 
+# ── LEFT PANEL (main chat) ────────────────────────────────────────────────
 with col1:
+
+    # Mode-specific info banners
+    if mode_disp == "Compare Two Documents":
+        doc_a = st.session_state.get("last_uploaded_file") or "—"
+        doc_b = st.session_state.get("doc_b_label") or "not loaded"
+        st.markdown(f"""
+        <div style="background:#001a1a;border:1px solid #006064;border-radius:10px;padding:12px 16px;margin-bottom:12px;">
+            <div style="font-size:0.72rem;font-weight:700;color:#4dd0e1;text-transform:uppercase;letter-spacing:0.08em;">
+                🔄 Comparison Mode Active
+            </div>
+            <div style="font-size:0.8rem;color:#80deea;margin-top:6px;">
+                <b>A:</b> {doc_a} &nbsp;·&nbsp; <b>B:</b> {doc_b}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    elif mode_disp == "Early Warning Scan":
+        st.markdown("""
+        <div style="background:#1a0505;border:1px solid #7f0000;border-radius:10px;padding:12px 16px;margin-bottom:12px;">
+            <div style="font-size:0.72rem;font-weight:700;color:#ef9a9a;text-transform:uppercase;letter-spacing:0.08em;">
+                ⚡ Early Warning Scan Mode
+            </div>
+            <div style="font-size:0.8rem;color:#ef9a9a;margin-top:4px;opacity:0.8;">
+                Queries trigger deep Gemini EWS analysis. Upload a document first.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Last intent indicator
+    last_intent = st.session_state.get("last_intent", "")
+    if last_intent:
+        st.markdown(
+            f'<div style="margin-bottom:8px;font-size:0.75rem;color:#4a7a9b;">Last intent: '
+            f'{_intent_chip(last_intent)}</div>',
+            unsafe_allow_html=True,
+        )
+
     prompt = render_chat_interface()
 
-    # ------------------------------------------------------------------
-    # EXECUTION PIPELINE
-    # ------------------------------------------------------------------
     if prompt:
         document_attached = bool(st.session_state["doc_text"])
         intent = classify_intent(prompt, document_attached, selected_model)
 
+        # Block Phi-3 for Tier 2 intents
+        if intent in ("COMPARE", "EWS") and selected_model == "Phi-3 (Local Edge)":
+            st.warning(
+                "⚠️ **Compare** and **EWS** modes are cloud-only. "
+                "Switch to **Gemini Pro (Cloud)** in the sidebar."
+            )
+            st.stop()
+
         try:
             with st.chat_message("assistant"):
-                with st.spinner("Analysing parameters…"):
+                with st.spinner("Analysing…"):
                     start_time = time.time()
 
-                    # ── PATH A: LOCAL EDGE (Phi-3) ────────────────────
-                    if selected_model == "Phi-3 (Local Edge)":
-                        engine          = load_inference_engine()
-                        local_citations = []
+                    # ====================================================
+                    # COMPARE
+                    # ====================================================
+                    if intent == "COMPARE":
+                        doc_a_text = st.session_state.get("doc_text") or ""
+                        doc_b_text = st.session_state.get("doc_b_text") or ""
+
+                        if not doc_a_text:
+                            answer_text = "⚠️ Upload **Document A** first (primary upload slot)."
+                            st.warning(answer_text)
+                        elif not doc_b_text:
+                            answer_text = "⚠️ Upload **Document B** (second slot appears in Compare mode)."
+                            st.warning(answer_text)
+                        else:
+                            doc_a_label = st.session_state.get("last_uploaded_file", "Document A")
+                            doc_b_label = st.session_state.get("doc_b_label", "Document B")
+                            st.caption(f"Sending both documents to Gemini for structured comparison…")
+                            logger.info(
+                                "COMPARE | A='%s' %d chars | B='%s' %d chars",
+                                doc_a_label, len(doc_a_text),
+                                doc_b_label, len(doc_b_text),
+                            )
+                            payload = {
+                                "query":             prompt,
+                                "doc_a_text":        doc_a_text,
+                                "doc_b_text":        doc_b_text,
+                                "doc_a_label":       doc_a_label,
+                                "doc_b_label":       doc_b_label,
+                                "doc_type":          st.session_state.get("document_type", "Document"),
+                                "masked_items":      st.session_state["masked_entities"],
+                                "include_regulatory": True,
+                            }
+                            resp = requests.post(API_COMPARE, json=payload, timeout=300)
+                            if resp.status_code == 200:
+                                data        = resp.json()
+                                answer_text = _unmask_response(data.get("answer", ""))
+                                st.session_state["last_execution_path"] = data.get("path", "Cloud Compare")
+                                st.session_state["last_citations"]      = data.get("citations_a", []) + data.get("citations_b", [])
+                                st.write_stream(stream_response(answer_text))
+                                # Citation viewer
+                                ca = data.get("citations_a", [])
+                                cb = data.get("citations_b", [])
+                                if ca or cb:
+                                    st.markdown("---")
+                                    ca_col, cb_col = st.columns(2)
+                                    with ca_col:
+                                        st.markdown(f"**📄 {doc_a_label}**")
+                                        for i, c in enumerate(ca[:4], 1):
+                                            with st.expander(f"Chunk {i} · score {c.get('rerank_score','?')}", expanded=False):
+                                                st.write(c.get("text", "")[:400])
+                                    with cb_col:
+                                        st.markdown(f"**📄 {doc_b_label}**")
+                                        for i, c in enumerate(cb[:4], 1):
+                                            with st.expander(f"Chunk {i} · score {c.get('rerank_score','?')}", expanded=False):
+                                                st.write(c.get("text", "")[:400])
+                            else:
+                                answer_text = f"API Error {resp.status_code}: {resp.text}"
+                                st.error(answer_text)
+
+                    # ====================================================
+                    # EWS
+                    # ====================================================
+                    elif intent == "EWS":
+                        doc_text = st.session_state.get("doc_text") or ""
+                        if not doc_text:
+                            answer_text = "⚠️ Upload a document before running an EWS scan."
+                            st.warning(answer_text)
+                        else:
+                            st.caption("Running deep early warning scan via Gemini…")
+                            ews_report = st.session_state.get("ews_report")
+                            local_sigs = ews_report.to_dict().get("signals", []) if ews_report else []
+                            payload = {
+                                "doc_text":     doc_text,
+                                "doc_label":    st.session_state.get("last_uploaded_file", "Document"),
+                                "doc_type":     st.session_state.get("document_type", "Document"),
+                                "masked_items": st.session_state["masked_entities"],
+                                "local_signals": local_sigs,
+                                "query":        prompt,
+                            }
+                            resp = requests.post(API_EWS, json=payload, timeout=300)
+                            if resp.status_code == 200:
+                                data        = resp.json()
+                                answer_text = _unmask_response(data.get("answer", ""))
+                                st.session_state["ews_cloud_result"]    = answer_text
+                                st.session_state["last_execution_path"] = data.get("path", "Cloud EWS")
+                                st.session_state["last_citations"]      = data.get("citations", [])
+                                st.write_stream(stream_response(answer_text))
+                                render_citations("HYBRID", data.get("citations", []))
+                            else:
+                                answer_text = f"API Error {resp.status_code}: {resp.text}"
+                                st.error(answer_text)
+
+                    # ====================================================
+                    # LOCAL EDGE — Phi-3
+                    # ====================================================
+                    elif selected_model == "Phi-3 (Local Edge)":
+                        engine, local_citations = load_inference_engine(), []
 
                         if engine is None:
                             answer_text = (
-                                "⚠️ Local inference is unavailable. "
-                                "Ensure `llama-cpp-python` is installed and the GGUF "
-                                f"model exists at `{SLM_MODEL_PATH}`."
+                                "⚠️ Local inference unavailable. "
+                                f"Ensure the GGUF model exists at `{SLM_MODEL_PATH}`."
                             )
                         else:
                             if intent == "EXTRACT":
-                                st.caption("Retrieving from uploaded document (FAISS + cross-encoder)…")
+                                st.caption("Retrieving from document (FAISS + cross-encoder)…")
                                 doc_context, local_citations = _retrieve_doc_chunks(prompt)
                                 reg_context = ""
                             elif intent == "HYBRID":
                                 st.caption("Retrieving from document and regulatory corpus…")
-                                doc_context, doc_cit = _retrieve_doc_chunks(prompt)
-                                reg_context, reg_cit = _retrieve_regulatory_chunks(prompt)
-                                local_citations = doc_cit + reg_cit
-                            else:  # GENERAL
-                                st.caption("Retrieving from regulatory corpus (Pinecone + cross-encoder)…")
+                                doc_context, dc = _retrieve_doc_chunks(prompt)
+                                reg_context, rc = _retrieve_regulatory_chunks(prompt)
+                                local_citations = dc + rc
+                            else:
+                                st.caption("Retrieving from regulatory corpus (Pinecone)…")
                                 doc_context = ""
                                 reg_context, local_citations = _retrieve_regulatory_chunks(prompt)
 
                             system_prefix = (
                                 "System: You are a credit risk analyst. "
-                                "Answer only within the domain of credit risk, banking regulation, "
-                                "financial analysis, and risk management. "
-                                "Be concise — 3-4 sentences. "
-                                "Use credit risk definitions for domain terms "
-                                "(e.g. CAR = Capital Adequacy Ratio, PD = Probability of Default).\n\n"
+                                "Answer only within credit risk, banking regulation, and financial analysis. "
+                                "Be concise — 3-4 sentences.\n\n"
                             )
-
                             if intent == "EXTRACT" and doc_context:
-                                context_section = doc_context
+                                ctx = doc_context
                             elif intent == "HYBRID":
                                 parts = []
-                                if doc_context:
-                                    parts.append(f"Uploaded Document Context:\n{doc_context}")
-                                if reg_context:
-                                    parts.append(f"Regulatory Context:\n{reg_context}")
-                                context_section = "\n\n".join(parts)
-                            elif reg_context:
-                                context_section = f"Regulatory Context:\n{reg_context}"
+                                if doc_context: parts.append(f"Document:\n{doc_context}")
+                                if reg_context: parts.append(f"Regulatory:\n{reg_context}")
+                                ctx = "\n\n".join(parts)
                             else:
-                                context_section = ""
+                                ctx = f"Regulatory:\n{reg_context}" if reg_context else ""
 
-                            slm_prompt = (
-                                f"<|user|>\n"
-                                f"{system_prefix}"
-                                f"{context_section}"
-                                f"Question: {prompt}\n<|end|>\n<|assistant|>"
-                            )
-
-                            st.caption("Generating response offline via Phi-3…")
+                            slm_prompt  = f"<|user|>\n{system_prefix}{ctx}Question: {prompt}\n<|end|>\n<|assistant|>"
+                            st.caption("Generating via Phi-3…")
                             raw_answer  = engine.run_inference(slm_prompt, max_tokens=512)
-                            answer_text = f"*(Local Edge — {intent})* {raw_answer}"
+                            answer_text = _unmask_response(f"*(Local Edge — {intent})* {raw_answer}")
 
-                        # Local path: unmask before display
-                        answer_text = _unmask_response(answer_text)
                         st.session_state["last_execution_path"] = f"Local Edge · Phi-3 · {intent}"
                         st.session_state["last_citations"]      = local_citations
                         st.session_state["last_intent"]         = intent
                         st.write_stream(stream_response(answer_text))
                         render_citations(intent, local_citations)
 
-                    # ── PATH B: CLOUD ORCHESTRATION (Gemini Pro) ──────
+                    # ====================================================
+                    # CLOUD — Gemini Pro
+                    # ====================================================
                     else:
-                        # Retrieve relevant chunks locally first, send only those
-                        # to the cloud — NOT the full doc_text.
-                        # for_cloud=True: plain chunk text, no Phi-3 system prefix,
-                        # uses _CLOUD_TOP_K, no _CHUNK_CHAR_CAP truncation.
-                        doc_payload_text    = ""
-                        cloud_doc_citations = []
-                        if document_attached and intent in ["EXTRACT", "HYBRID"]:
-                            st.caption("Retrieving relevant chunks from uploaded document (FAISS)…")
+                        doc_payload_text, cloud_doc_citations = "", []
+                        if document_attached and intent in ("EXTRACT", "HYBRID"):
+                            st.caption("Retrieving relevant chunks from document (FAISS)…")
                             doc_payload_text, cloud_doc_citations = _retrieve_doc_chunks(
                                 prompt, for_cloud=True
                             )
@@ -650,55 +973,48 @@ with col1:
                         payload = {
                             "query":        prompt,
                             "intent":       intent,
-                            "doc_text":     doc_payload_text,   # masked chunk text only
+                            "doc_text":     doc_payload_text,
                             "masked_items": st.session_state["masked_entities"],
-                            "doc_type":     st.session_state.get("document_type", "Document")
+                            "doc_type":     st.session_state.get("document_type", "Document"),
                         }
 
-                        # Debug — visible in terminal, never in UI
-                        logger.info("--- Outgoing FastAPI Payload ---")
-                        logger.info("Query  : %s", payload["query"])
-                        logger.info("Intent : %s", payload["intent"])
-                        preview = (payload["doc_text"] or "")[:200]
-                        logger.info("doc_text preview (200 chars): %s%s",
-                                    preview, "…" if len(payload["doc_text"] or "") > 200 else "")
-                        logger.info("masked_items count: %d", len(payload["masked_items"] or {}))
-                        logger.info("--------------------------------")
+                        logger.info(
+                            "Cloud payload | intent=%s doc_preview=%s masked=%d",
+                            intent,
+                            (doc_payload_text or "")[:120],
+                            len(st.session_state["masked_entities"]),
+                        )
 
-                        st.caption("Routing scrubbed chunk payload to FastAPI orchestration tier…")
-                        response = requests.post(API_ENDPOINT, json=payload, timeout=120)
+                        st.caption("Routing to Gemini via FastAPI…")
+                        resp = requests.post(API_ENDPOINT, json=payload, timeout=120)
 
-                        if response.status_code == 200:
-                            data    = response.json()
-                            raw_ans = data.get("answer", "")
-
-                            # Unmask LLM response — user sees real entity names
-                            answer_text = _unmask_response(raw_ans)
-
-                            st.session_state["last_execution_path"] = data.get(
-                                "path", "Cloud Orchestrated"
-                            )
-                            # Merge local doc citations with regulatory citations from cloud
-                            backend_citations = data.get("citations", [])
-                            st.session_state["last_citations"] = cloud_doc_citations + backend_citations
-                            st.session_state["last_intent"]    = intent
-
+                        if resp.status_code == 200:
+                            data        = resp.json()
+                            answer_text = _unmask_response(data.get("answer", ""))
+                            st.session_state["last_execution_path"] = data.get("path", "Cloud")
+                            st.session_state["last_citations"]      = cloud_doc_citations + data.get("citations", [])
+                            st.session_state["last_intent"]         = intent
                             st.write_stream(stream_response(answer_text))
                             render_citations(intent, st.session_state["last_citations"])
                         else:
-                            answer_text = f"API Error {response.status_code}: {response.text}"
+                            answer_text = f"API Error {resp.status_code}: {resp.text}"
                             st.error(answer_text)
 
-                    # ── TIMING + HISTORY + AUDIT TRAIL ───────────────
+                    # ── TIMING + AUDIT TRAIL ──────────────────────────
                     elapsed = round(time.time() - start_time, 2)
                     st.session_state["last_execution_time"] = elapsed
-                    st.caption(f"⏱️ **Response generated in {elapsed} seconds.**")
+                    st.caption(f"⏱️ **{elapsed}s** · Intent: {intent}")
 
-                    # Tier 1 — append to session audit trail
                     try:
                         from local.analysis.audit_logger import build_entry
-                        breach_report = st.session_state.get("breach_report")
-                        entry = build_entry(
+                        breach = st.session_state.get("breach_report")
+                        ews    = st.session_state.get("ews_report")
+                        breach_sum = " | ".join(filter(None, [
+                            breach.summary() if breach else None,
+                            ews.summary()    if ews    else None,
+                        ])) or None
+
+                        st.session_state["audit_trail"].append(build_entry(
                             query          = prompt,
                             intent         = intent,
                             answer         = answer_text,
@@ -707,11 +1023,10 @@ with col1:
                             elapsed_sec    = elapsed,
                             masked_count   = len(st.session_state.get("masked_entities", {})),
                             doc_filename   = st.session_state.get("last_uploaded_file"),
-                            breach_summary = breach_report.summary() if breach_report else None,
-                        )
-                        st.session_state["audit_trail"].append(entry)
+                            breach_summary = breach_sum,
+                        ))
                     except Exception as ae:
-                        logger.warning("Audit trail entry failed: %s", ae)
+                        logger.warning("Audit trail: %s", ae)
 
                     st.session_state["messages"].append({
                         "role":      "assistant",
@@ -723,6 +1038,6 @@ with col1:
 
         except requests.exceptions.ConnectionError:
             st.error(
-                "🚨 Connection Refused: Ensure the FastAPI backend is running on "
-                "`http://127.0.0.1:8000`"
+                "🚨 Connection refused — ensure FastAPI is running: "
+                "`uvicorn app.main:app --reload --port 8000`"
             )

@@ -1,88 +1,127 @@
+"""
+local/privacy/pipeline.py
+
+Four-phase local document processing pipeline:
+  Phase 1 — Docling extraction → raw Markdown
+  Phase 2 — PII masking (regex + spaCy NER)
+  Phase 3 — Egress firewall
+  Phase 4 — Financial extraction + policy check + EWS detection  ← Tier 1+2
+
+Phase 4 runs on RAW text from Phase 1 (before masking) so numeric values
+are intact. The masker preserves metric values in place after this runs.
+"""
+
 import io
 import logging
 from pathlib import Path
 from typing import Dict, Any, Union
 
-# Import components from the local privacy package layout
-from local.privacy.extractor import DocumentExtractor
+from local.privacy.extractor       import DocumentExtractor
 from local.privacy.entity_registry import EntityRegistry
-from local.privacy.masker import DocumentMasker
-from local.privacy.validator import DocumentValidator
+from local.privacy.masker          import DocumentMasker
+from local.privacy.validator       import DocumentValidator
 
-# Configure structured logging for pipeline lifecycle auditing
 logger = logging.getLogger(__name__)
 
+
 class PrivacyPipeline:
-    """
-    Facade controller that orchestrates the local document ingestion flow:
-    Extracts Markdown layouts, masks PII while protecting metrics, and 
-    runs a pre-flight firewall audit before data leaves the local boundary.
-    """
-    
+
     def __init__(self, spacy_model: str = "en_core_web_trf") -> None:
-        """
-        Initializes the privacy pipeline and boots up internal underlying dependencies.
-        
-        Args:
-            spacy_model: Name of the spaCy NLP pipeline to use for entity extraction.
-                         Defaults to 'en_core_web_trf' (Transformer-based accuracy).
-        """
-        logger.info("Initializing Local Privacy Orchestration Pipeline Components...")
-        
-        # Instantiate stateless or persistent workers
+        logger.info("Initialising Privacy Pipeline…")
         self.extractor = DocumentExtractor()
-        self.registry = EntityRegistry()
-        self.masker = DocumentMasker(registry=self.registry, spacy_model=spacy_model)
+        self.registry  = EntityRegistry()
+        self.masker    = DocumentMasker(registry=self.registry, spacy_model=spacy_model)
         self.validator = DocumentValidator()
-        
-        logger.info("All local privacy pipeline sub-systems fully initialized.")
+        logger.info("Privacy Pipeline ready.")
 
-    def process_document(self, file_source: Union[str, Path, io.BytesIO], filename: str, doc_type: str = None) -> Dict[str, Any]:
+    def process_document(
+        self,
+        file_source: Union[str, Path, io.BytesIO],
+        filename:    str,
+        doc_type:    str = "Internal Credit Proposal (Memo)",
+    ) -> Dict[str, Any]:
         """
-        Executes the end-to-end local data-cleaning processing loop.
+        End-to-end document processing.
 
-        Args:
-            file_source: Either a system path string, a Path object, or an in-memory 
-                         BytesIO buffer uploaded directly via the UI tier.
-            filename: The baseline name of the document, utilized for generating metadata logs.
-
-        Returns:
-            A structured execution summary containing the anonymized payload text,
-            structural metadata parameters, and the complete session token audit logs.
-            
-        Raises:
-            Exception: Propagates extraction errors, masking faults, or 
-                       Pre-flight LeakageValidationErrors to the UI layer.
+        Returns
+        -------
+        {
+            "masked_text"        : str
+            "raw_text"           : str            — pre-mask (for EWS / financial extraction)
+            "metadata"           : dict
+            "validation_report"  : dict
+            "audit_log"          : list
+            "registry_instance"  : EntityRegistry
+            "financial_profile"  : FinancialProfile | None
+            "breach_report"      : BreachReport   | None
+            "ews_report"         : EWSReport      | None
+        }
         """
-        logger.info(f"Pipeline execution started for target context payload: '{filename}'")
-        
-        # Ensure fresh registry isolation when beginning a completely new document tracking loop
+        logger.info("Pipeline start: '%s' (doc_type=%s)", filename, doc_type)
         self.registry.clear()
-        
-        # Phase 1: Structural Analysis & Layout Extraction (Docling)
-        logger.info("Pipeline Phase 1/3: Initiating structural text extraction...")
-        extraction_result = self.extractor.extract(file_source, filename)
-        raw_markdown = extraction_result["text"]
-        document_metadata = extraction_result["metadata"]
-        logger.info(f"Phase 1 Complete. Extracted {len(raw_markdown)} characters from raw document source.")
-        
-        # Phase 2: Contextual PII Anonymization & Metric Freezing (spaCy + Regex Guards)
-        logger.info("Pipeline Phase 2/3: Passing text payload to context masking matrix...")
-        masked_markdown = self.masker.mask(raw_markdown)
-        logger.info("Phase 2 Complete. Privacy preservation entity mapping sequence completed.")
-        
-        # Phase 3: Pre-Flight Safety Firewall Verification (Regex Leak Check)
-        logger.info("Pipeline Phase 3/3: Running pre-flight egress security checks...")
-        # Throws a LeakageValidationError if unmasked sensitive tracking strings match patterns
-        validation_status = self.validator.validate(masked_markdown)
-        logger.info("Phase 3 Complete. Egress security verification passed.")
-        
-        # Compile complete processing summary object
-        logger.info(f"Successfully processed and cleared document execution path for: '{filename}'")
+
+        # ── Phase 1: Extraction ────────────────────────────────────────
+        logger.info("Phase 1/4: Docling extraction…")
+        extraction = self.extractor.extract(file_source, filename)
+        raw_text   = extraction["text"]
+        metadata   = extraction["metadata"]
+        logger.info("Phase 1 done: %d chars.", len(raw_text))
+
+        # ── Phase 4 (runs on raw text BEFORE masking) ─────────────────
+        financial_profile = None
+        breach_report     = None
+        ews_report        = None
+        try:
+            from local.analysis.financial_extractor import FinancialExtractor
+            from local.analysis.policy_checker      import PolicyChecker
+            from local.analysis.ews_detector        import EarlyWarningDetector
+
+            logger.info("Phase 4a: Financial extraction…")
+            financial_profile = FinancialExtractor().extract(raw_text, doc_type=doc_type)
+
+            logger.info("Phase 4b: Policy breach check…")
+            breach_report = PolicyChecker().check(financial_profile)
+
+            logger.info("Phase 4c: Early warning signal detection…")
+            ews_report = EarlyWarningDetector().detect(
+                raw_text=raw_text,
+                financial_profile=financial_profile,
+                doc_type=doc_type,
+            )
+
+            logger.info(
+                "Phase 4 done: metrics=%d breaches=%d warnings=%d ews_signals=%d ews_risk=%s",
+                len([k for k, v in financial_profile.to_dict().items()
+                     if v and k not in ("doc_type", "extraction_warnings")]),
+                breach_report.breach_count,
+                breach_report.warning_count,
+                len(ews_report.signals),
+                ews_report.risk_level,
+            )
+        except ImportError:
+            logger.warning("analysis package not available — skipping Phase 4.")
+        except Exception as e:
+            logger.warning("Phase 4 failed (%s) — continuing without analytics.", e, exc_info=True)
+
+        # ── Phase 2: Masking ───────────────────────────────────────────
+        logger.info("Phase 2/4: PII masking…")
+        masked_text = self.masker.mask(raw_text)
+        logger.info("Phase 2 done.")
+
+        # ── Phase 3: Egress firewall ───────────────────────────────────
+        logger.info("Phase 3/4: Egress validation…")
+        validation_status = self.validator.validate(masked_text)
+        logger.info("Phase 3 done.")
+
+        logger.info("Pipeline complete: '%s'", filename)
         return {
-            "masked_text": masked_markdown,
-            "metadata": document_metadata,
+            "masked_text":       masked_text,
+            "raw_text":          raw_text,
+            "metadata":          metadata,
             "validation_report": validation_status,
-            "audit_log": self.registry.get_audit_log(),
-            "registry_instance": self.registry
+            "audit_log":         self.registry.get_audit_log(),
+            "registry_instance": self.registry,
+            "financial_profile": financial_profile,
+            "breach_report":     breach_report,
+            "ews_report":        ews_report,
         }
