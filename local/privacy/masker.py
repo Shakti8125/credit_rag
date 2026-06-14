@@ -58,6 +58,43 @@ class DocumentMasker:
             ("EIN", re.compile(r"\b\d{2}-\d{7}\b")),
         ]
 
+        self.bank_patterns = [
+            "Emirates NBD",
+            "First Abu Dhabi Bank",
+            "FAB",
+            "Abu Dhabi Commercial Bank",
+            "ADCB",
+            "Dubai Islamic Bank",
+            "DIB",
+            "Mashreq Bank",
+            "Mashreq",
+            "RAKBANK",
+            "Rak Bank",
+            "Commercial Bank of Dubai",
+            "CBD Bank",
+            "National Bank of Abu Dhabi",
+            "NBAD",
+            "Al Hilal Bank",
+            "HSBC UAE",
+            "Standard Chartered UAE",
+            "Citibank UAE",
+
+            # GCC / Middle East
+            "Qatar National Bank",
+            "QNB",
+            "Doha Bank",
+            "Kuwait Finance House",
+            "KFH",
+            "National Bank of Kuwait",
+            "NBK",
+            "Al Rajhi Bank",
+            "Saudi National Bank",
+            "SNB",
+            "Arab National Bank",
+            "Bank Muscat",
+            "Oman Arab Bank",
+        ]
+
     def _apply_regex_masks(self, text: str) -> str:
         """
         Pre-pass: replaces structured PII (phones, emails, SSNs, EINs) with
@@ -103,6 +140,32 @@ class DocumentMasker:
             if not (ent_end <= p_start or ent_start >= p_end):
                 return True
         return False
+    
+    def _mask_banks(self, text: str) -> str:
+        """
+        Deterministic bank masking.
+        Runs before Gemini/spaCy.
+        """
+
+        for bank in sorted(self.bank_patterns, key=len, reverse=True):
+
+            pattern = re.compile(
+                rf"\b{re.escape(bank)}\b",
+                re.IGNORECASE
+            )
+
+            for match in pattern.finditer(text):
+                token = self.registry.register_entity(
+                    match.group(),
+                    "BANK"
+                )
+
+                text = text.replace(
+                    match.group(),
+                    token
+                )
+
+        return text
 
     def mask(self, text: str) -> str:
         """
@@ -118,7 +181,9 @@ class DocumentMasker:
             return text
 
         # Step 1: Regex pre-pass for structured PII spaCy would miss
+        text = self._mask_banks(text)
         text = self._apply_regex_masks(text)
+
 
         # Step 2: Record regions containing vital financial information
         protected_spans = self._get_protected_spans(text)

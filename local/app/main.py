@@ -51,9 +51,38 @@ st.markdown("""
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
 html, body, [class*="css"] {
-    font-family: 'Inter', sans-serif;
-    background-color: #070d19;
-    color: #c8d8e8;
+
+    font-family:'Inter',sans-serif;
+
+    background-color:var(--bg);
+    color:var(--text);
+
+}
+
+
+:root {
+
+--bg:#ffffff;
+--surface:#f8fafc;
+--text:#111827;
+--border:#e2e8f0;
+--accent:#2563eb;
+
+}
+
+
+@media(prefers-color-scheme:dark){
+
+:root {
+
+--bg:#0f172a;
+--surface:#1e293b;
+--text:#f8fafc;
+--border:#334155;
+--accent:#60a5fa;
+
+}
+
 }
 
 /* ── Sidebar ─────────────────────────────────────────────────── */
@@ -342,12 +371,15 @@ _DEFAULTS = {
     "last_execution_path":  "Idle",
     "last_citations":       [],
     "last_intent":          "GENERAL",
-    "masked_entities":      {},
-    "preserved_financials": [],
+
+    # Only masked words and original values
+    # No financial values stored
+    "mask_dictionary":      {},
+
     "doc_text":             None,
     "doc_faiss_index":      None,
     "registry":             None,
-    "last_uploaded_file":   None,   # NOTE: initialised to None, not "session"
+    "last_uploaded_file":   None,
     "messages":             [],
     "last_execution_time":  None,
     "financial_profile":    None,
@@ -360,6 +392,7 @@ _DEFAULTS = {
     "ews_report":           None,
     "ews_cloud_result":     None,
 }
+
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -378,21 +411,6 @@ def stream_response(text: str):
         time.sleep(0.03)
 
 
-def _extract_preserved_financials(masked_text: str) -> list:
-    import re
-    patterns = [
-        re.compile(r'\b(?:AED|USD|EUR|GBP)?\s?[\$\u20AC\u00A3]?\s?\d+(?:,\d{3})*(?:\.\d+)?\s?(?:M|B|k|Million|Billion)?\b', re.IGNORECASE),
-        re.compile(r'\b(?:DSCR|LTV|Leverage|TOL/ATNW|Debt/EBITDA|ROE|ROA)\b\s*(?:of|is)?\s*\d+(?:\.\d+)?\s?%?x?\b', re.IGNORECASE),
-        re.compile(r'\b\d+(?:\.\d+)?\s?%\b'),
-        re.compile(r'\b\d+(?:\.\d+)?\s?x\b', re.IGNORECASE),
-    ]
-    found = set()
-    for pattern in patterns:
-        for match in pattern.finditer(masked_text):
-            val = match.group().strip()
-            if len(val) > 1:
-                found.add(val)
-    return sorted(found)
 
 
 def _unmask_response(text: str) -> str:
@@ -400,7 +418,7 @@ def _unmask_response(text: str) -> str:
     registry = st.session_state.get("registry")
     if registry is not None:
         return registry.unmask_text(text)
-    mapping = st.session_state.get("masked_entities", {})
+    mapping = st.session_state.get("mask_dictionary", {})
     for ph in sorted(mapping.keys(), key=len, reverse=True):
         text = text.replace(ph, mapping[ph])
     return text
@@ -431,13 +449,19 @@ def process_uploaded_document(uploaded_file, slot: str = "primary") -> bool:
             doc_type=doc_type,
         )
 
-        masked_entities      = {e["placeholder"]: e["original_entity"] for e in result["audit_log"]}
-        preserved_financials = _extract_preserved_financials(result["masked_text"])
+        registry = result.get("registry_instance")
+
+        if registry:
+            mask_dictionary = registry.get_mask_dictionary()
+        else:
+            mask_dictionary = {
+                e["placeholder"]: e["original_entity"]
+                for e in result.get("audit_log", [])
+            }
 
         if slot == "primary":
             st.session_state["doc_text"]             = result["masked_text"]
-            st.session_state["masked_entities"]      = masked_entities
-            st.session_state["preserved_financials"] = preserved_financials
+            st.session_state["mask_dictionary"] = mask_dictionary
             st.session_state["last_uploaded_file"]   = uploaded_file.name
             st.session_state["registry"]             = result["registry_instance"]
             st.session_state["financial_profile"]    = result.get("financial_profile")
@@ -469,7 +493,7 @@ def process_uploaded_document(uploaded_file, slot: str = "primary") -> bool:
 
         logger.info(
             "Doc processed [%s]: %d entities masked, %d financials",
-            slot, len(masked_entities), len(preserved_financials),
+            slot, len(mask_dictionary),
         )
         return True
 
@@ -744,8 +768,7 @@ with col2:
 
         st.markdown('<div class="panel-section">Privacy Audit</div>', unsafe_allow_html=True)
         render_masking_log(
-            st.session_state["masked_entities"],
-            st.session_state["preserved_financials"],
+            st.session_state["mask_dictionary"]
         )
 
     st.markdown('<div class="panel-section">Session Audit Trail</div>', unsafe_allow_html=True)
@@ -844,7 +867,7 @@ with col1:
                                 "doc_a_label":       doc_a_label,
                                 "doc_b_label":       doc_b_label,
                                 "doc_type":          st.session_state.get("document_type", "Document"),
-                                "masked_items":      st.session_state["masked_entities"],
+                                "masked_items":      st.session_state["mask_dictionary"],
                                 "include_regulatory": True,
                             }
                             resp = requests.post(API_COMPARE, json=payload, timeout=300)
@@ -890,7 +913,7 @@ with col1:
                                 "doc_text":     doc_text,
                                 "doc_label":    st.session_state.get("last_uploaded_file", "Document"),
                                 "doc_type":     st.session_state.get("document_type", "Document"),
-                                "masked_items": st.session_state["masked_entities"],
+                                "masked_items": st.session_state["mask_dictionary"],
                                 "local_signals": local_sigs,
                                 "query":        prompt,
                             }
@@ -974,7 +997,7 @@ with col1:
                             "query":        prompt,
                             "intent":       intent,
                             "doc_text":     doc_payload_text,
-                            "masked_items": st.session_state["masked_entities"],
+                            "masked_items": st.session_state["mask_dictionary"],
                             "doc_type":     st.session_state.get("document_type", "Document"),
                         }
 
@@ -982,7 +1005,7 @@ with col1:
                             "Cloud payload | intent=%s doc_preview=%s masked=%d",
                             intent,
                             (doc_payload_text or "")[:120],
-                            len(st.session_state["masked_entities"]),
+                            len(st.session_state["mask_dictionary"]),
                         )
 
                         st.caption("Routing to Gemini via FastAPI…")
@@ -1021,7 +1044,7 @@ with col1:
                             citations      = st.session_state["last_citations"],
                             execution_path = st.session_state["last_execution_path"],
                             elapsed_sec    = elapsed,
-                            masked_count   = len(st.session_state.get("masked_entities", {})),
+                            masked_count   = len(st.session_state.get("mask_dictionary", {})),
                             doc_filename   = st.session_state.get("last_uploaded_file"),
                             breach_summary = breach_sum,
                         ))

@@ -54,20 +54,32 @@ class EntityRegistry:
             for placeholder, real_value in sorted_tokens:
                 unmasked = unmasked.replace(placeholder, real_value)
         return unmasked
+    
+    def get_audit_log(self):
+        """
+        Backward compatible audit log.
+        Used by privacy pipeline.
+        Does not include financial values.
+        """
 
-    def get_audit_log(self) -> List[Dict[str, Any]]:
-        """
-        Formats registry entries into an exportable layout for masking_log.py.
-        """
         with self._lock:
+
             return [
                 {
                     "placeholder": placeholder,
-                    "original_entity": real_value,
-                    "type": placeholder.strip("[]").split("_")[0]
+                    "original_entity": original
                 }
-                for placeholder, real_value in self._reverse_registry.items()
+                for placeholder, original
+                in self._reverse_registry.items()
             ]
+
+    def get_mask_dictionary(self) -> Dict[str, str]:
+
+        with self._lock:
+
+            return dict(
+                self._reverse_registry
+            )
 
     def clear(self) -> None:
         """Resets the state registry for a new document session execution loop."""

@@ -127,7 +127,19 @@ class MarkdownChunker:
                 continue
 
             meta    = doc.metadata
-            section = " > ".join(str(v) for k, v in sorted(meta.items()) if v)
+            section_parts = []
+
+            for key in [
+                "h1",
+                "h2",
+                "h3",
+                "h4"
+            ]:
+                if key in meta:
+                    section_parts.append(meta[key])
+
+
+            section = " > ".join(section_parts)
 
             clean_text = _sanitise_placeholders(raw_text)
             if section:
