@@ -14,6 +14,18 @@
 FROM public.ecr.aws/lambda/python:3.11
 
 # ---------------------------------------------------------------------------
+# 0. Upgrade pip FIRST. This is load-bearing, not hygiene.
+#
+# The base image ships pip 24.0, which predates Metadata-Version 2.4. Wheels
+# published with that metadata (faiss-cpu, numpy, and a growing number of
+# others) are silently treated as incompatible, so pip falls back to their
+# source tarballs — and then meson dies with "Unknown compiler(s)" because a
+# Lambda base image has no C toolchain. Upgrading pip makes the wheels visible
+# again and keeps the build compiler-free.
+# ---------------------------------------------------------------------------
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# ---------------------------------------------------------------------------
 # 1. CPU-only torch, installed BEFORE everything else.
 #
 # sentence-transformers depends on torch. If pip resolves it from PyPI it pulls
