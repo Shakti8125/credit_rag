@@ -19,6 +19,7 @@ import numpy as np
 from typing import List, Tuple
 
 from local.rag.chunker import TextChunk
+from shared.hybrid import BM25Okapi, rrf_fuse
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ class LocalDocumentIndex:
         self._index  = None          # faiss.IndexFlatIP
         self._chunks: List[TextChunk] = []
         self._dim:    int = 0
+        self._bm25:  BM25Okapi = None   # lexical side of hybrid search
 
     # ------------------------------------------------------------------
     # Build
@@ -81,8 +83,11 @@ class LocalDocumentIndex:
         self._index = faiss.IndexFlatIP(self._dim)
         self._index.add(embeddings.astype(np.float32))
 
+        # Lexical index for the hybrid path — cheap to build, no model needed
+        self._bm25 = BM25Okapi(texts)
+
         logger.info(
-            "FAISS index built: %d vectors, dim=%d.",
+            "Hybrid index built: %d vectors (dim=%d) + BM25.",
             self._index.ntotal, self._dim,
         )
 
@@ -92,11 +97,12 @@ class LocalDocumentIndex:
 
     def search(self, query: str, top_k: int = 10) -> List[Tuple[TextChunk, float]]:
         """
-        Embeds the query and returns the top-k most similar chunks as
-        (TextChunk, cosine_score) tuples sorted descending.
+        Hybrid search: dense (FAISS cosine) and lexical (BM25) rankings are
+        fused with Reciprocal Rank Fusion. Returns (TextChunk, fused_score)
+        tuples sorted descending.
 
         Returns a larger pool than the final top-k so the cross-encoder
-        in main.py can rerank before truncating to the display limit.
+        can rerank before truncating to the display limit.
         """
         if self._index is None:
             raise RuntimeError("Index has not been built yet. Call build() first.")
@@ -105,6 +111,7 @@ class LocalDocumentIndex:
 
         top_k = min(top_k, len(self._chunks))
 
+        # ── Dense ranking ─────────────────────────────────────────────
         query_vec: np.ndarray = self._model.encode(
             [query],
             convert_to_numpy=True,
@@ -112,16 +119,18 @@ class LocalDocumentIndex:
         ).astype(np.float32)
 
         scores, indices = self._index.search(query_vec, top_k)
+        dense_rank = [int(i) for i in indices[0] if i != -1]
 
-        results = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx == -1:
-                continue
-            results.append((self._chunks[idx], float(score)))
+        # ── Lexical ranking ───────────────────────────────────────────
+        bm25_rank = [i for i, _ in self._bm25.top_n(query, top_k)] if self._bm25 else []
+
+        # ── RRF fusion ────────────────────────────────────────────────
+        fused = rrf_fuse([dense_rank, bm25_rank])[:top_k]
+        results = [(self._chunks[idx], float(score)) for idx, score in fused]
 
         logger.info(
-            "FAISS search '%s…': top-%d scores %s",
-            query[:40], top_k, [f"{s:.3f}" for _, s in results],
+            "Hybrid search '%s…': dense=%d bm25=%d fused=%d",
+            query[:40], len(dense_rank), len(bm25_rank), len(results),
         )
         return results
 

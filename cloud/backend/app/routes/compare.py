@@ -1,41 +1,26 @@
 """
 cloud/backend/app/routes/compare.py  — Tier 2: Multi-document comparison.
-Cloud-only. No local.* imports — fully self-contained.
+Cloud-only. No local.* imports.
 
-All chunking and FAISS logic is inlined so this module works purely within
-the cloud/backend package scope.
+Chunking + hybrid retrieval delegated to app.services.doc_search
+(shared with /ews).
 
 POST /compare
 """
 
-import re
 import logging
-import numpy as np
+import time
 from typing import Optional, List, Dict, Any
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
-from app.services.generation import GenerationService
-from app.services.retrieval  import PineconeRetrievalService, Citation
+from app.services.retrieval import Citation
+from app.services.engines  import llm_engine as _llm, retrieval_engine as _retrieval, record_telemetry
+from app.services.doc_search import chunk_text, hybrid_search
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-# ---------------------------------------------------------------------------
-# Singletons
-# ---------------------------------------------------------------------------
-try:
-    _llm = GenerationService()
-except Exception as e:
-    logger.warning("GenerationService unavailable: %s", e)
-    _llm = None
-
-try:
-    _retrieval = PineconeRetrievalService()
-except Exception as e:
-    logger.warning("PineconeRetrievalService unavailable: %s", e)
-    _retrieval = None
 
 # Tier 2 knobs — larger than standard route
 _TOP_K       = 7
@@ -55,7 +40,6 @@ class CompareRequest(BaseModel):
     doc_a_label:        Optional[str]            = "Document A"
     doc_b_label:        Optional[str]            = "Document B"
     doc_type:           Optional[str]            = "Credit Document"
-    masked_items:       Optional[Dict[str, str]] = None
     include_regulatory: bool                     = True
 
 
@@ -68,137 +52,9 @@ class CompareResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Self-contained chunker (no local.* dependency)
-# ---------------------------------------------------------------------------
-
-def _chunk_text(text: str) -> List[str]:
-    """
-    Simple recursive character splitter with overlap.
-    Splits on paragraph breaks first, then sentences, then words.
-    Returns list of chunk strings.
-    """
-    if not text or not text.strip():
-        return []
-
-    separators = ["\n\n", "\n", ". ", " ", ""]
-    chunks: List[str] = []
-
-    def _split(s: str, sep_idx: int):
-        if len(s) <= _CHUNK_SIZE:
-            if s.strip():
-                chunks.append(s.strip())
-            return
-        sep = separators[sep_idx] if sep_idx < len(separators) else ""
-        parts = s.split(sep) if sep else list(s)
-        current = ""
-        for part in parts:
-            add = part + (sep if sep else "")
-            if len(current) + len(add) <= _CHUNK_SIZE:
-                current += add
-            else:
-                if current.strip():
-                    chunks.append(current.strip())
-                # overlap: carry last _CHUNK_OVER chars forward
-                overlap = current[-_CHUNK_OVER:] if len(current) > _CHUNK_OVER else current
-                current = overlap + add
-        if current.strip():
-            chunks.append(current.strip())
-
-    _split(text, 0)
-    return [c for c in chunks if len(c.split()) >= 8]  # drop stub fragments
-
-
-# ---------------------------------------------------------------------------
-# Self-contained FAISS index builder (no local.* dependency)
-# ---------------------------------------------------------------------------
-
-def _build_faiss_index(chunks: List[str], label: str):
-    """
-    Embeds chunks with all-MiniLM-L6-v2 and returns a (faiss_index, embeddings)
-    tuple. Returns (None, None) on failure.
-    """
-    try:
-        import faiss
-        from sentence_transformers import SentenceTransformer
-
-        model      = SentenceTransformer("all-MiniLM-L6-v2")
-        embeddings = model.encode(
-            chunks,
-            batch_size=32,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        ).astype(np.float32)
-
-        dim   = embeddings.shape[1]
-        index = faiss.IndexFlatIP(dim)
-        index.add(embeddings)
-
-        logger.info("FAISS built for %s: %d chunks, dim=%d", label, len(chunks), dim)
-        return index, model
-
-    except ImportError as e:
-        logger.error("faiss-cpu or sentence-transformers missing: %s", e)
-        return None, None
-    except Exception as e:
-        logger.error("FAISS build failed for %s: %s", label, e, exc_info=True)
-        return None, None
-
-
-def _search_faiss(
-    query: str,
-    chunks: List[str],
-    index,
-    model,
-    top_k: int = _TOP_K,
-    rerank_pool: int = _RERANK_POOL,
-) -> List[Dict[str, Any]]:
-    """
-    Searches the FAISS index for the query, optionally reranks with cross-encoder.
-    Returns list of {"text": str, "score": float, "chunk_idx": int}.
-    """
-    if index is None or not chunks:
-        return []
-
-    fetch_k = min(rerank_pool, len(chunks))
-
-    q_vec = model.encode(
-        [query], normalize_embeddings=True, convert_to_numpy=True
-    ).astype(np.float32)
-
-    scores, indices = index.search(q_vec, fetch_k)
-
-    candidates = [
-        {"text": chunks[i], "score": float(s), "chunk_idx": int(i)}
-        for s, i in zip(scores[0], indices[0])
-        if i >= 0
-    ]
-
-    # Cross-encoder rerank if available
-    if _retrieval is not None and _retrieval._cross_encoder is not None and len(candidates) > 1:
-        try:
-            pairs  = [(query, c["text"]) for c in candidates]
-            ce_scores = _retrieval._cross_encoder.predict(pairs)
-            for cand, ce_s in zip(candidates, ce_scores):
-                cand["score"] = float(ce_s)
-            candidates.sort(key=lambda c: c["score"], reverse=True)
-            logger.info("Cross-encoder reranked %d→top-%d", len(candidates), top_k)
-        except Exception as e:
-            logger.warning("Cross-encoder reranking failed: %s", e)
-
-    return candidates[:top_k]
-
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _unmask(text: str, masked_items: Optional[Dict[str, str]]) -> str:
-    if not masked_items or not text:
-        return text
-    for ph in sorted(masked_items.keys(), key=len, reverse=True):
-        text = text.replace(ph, masked_items[ph])
-    return text
 
 
 def _format_for_prompt(results: List[Dict], label: str) -> str:
@@ -280,22 +136,23 @@ async def handle_comparison(payload: CompareRequest):
     if not payload.doc_b_text.strip():
         raise HTTPException(status_code=400, detail="doc_b_text is empty.")
 
+    _t0 = time.perf_counter()
+
     try:
         # ── Chunk ─────────────────────────────────────────────────────
-        chunks_a = _chunk_text(payload.doc_a_text)
-        chunks_b = _chunk_text(payload.doc_b_text)
+        chunks_a = chunk_text(payload.doc_a_text, _CHUNK_SIZE, _CHUNK_OVER)
+        chunks_b = chunk_text(payload.doc_b_text, _CHUNK_SIZE, _CHUNK_OVER)
         logger.info(
             "Chunks: A=%d B=%d (size=%d overlap=%d)",
             len(chunks_a), len(chunks_b), _CHUNK_SIZE, _CHUNK_OVER,
         )
 
-        # ── Build FAISS ───────────────────────────────────────────────
-        idx_a, model_a = _build_faiss_index(chunks_a, payload.doc_a_label)
-        idx_b, model_b = _build_faiss_index(chunks_b, payload.doc_b_label)
-
-        # ── Retrieve ──────────────────────────────────────────────────
-        results_a = _search_faiss(payload.query, chunks_a, idx_a, model_a)
-        results_b = _search_faiss(payload.query, chunks_b, idx_b, model_b)
+        # ── Hybrid retrieve (dense + BM25 fused, cross-encoder reranked) ──
+        _ce = _retrieval._cross_encoder if _retrieval is not None else None
+        results_a = hybrid_search(payload.query, chunks_a, _TOP_K, _RERANK_POOL,
+                                  cross_encoder=_ce, label=payload.doc_a_label)
+        results_b = hybrid_search(payload.query, chunks_b, _TOP_K, _RERANK_POOL,
+                                  cross_encoder=_ce, label=payload.doc_b_label)
 
         reg_citations: List[Citation] = []
         if payload.include_regulatory and _retrieval:
@@ -327,24 +184,28 @@ async def handle_comparison(payload: CompareRequest):
         # ── Generate ──────────────────────────────────────────────────
         raw_answer = _llm.generate_text(prompt=prompt, max_tokens=8192)
 
-        # ── Unmask STRICTLY after generation ──────────────────────────
-        answer = _unmask(raw_answer, payload.masked_items)
-
-        # Build citation dicts (unmask text field too)
+        # Response returned MASKED — the frontend unmasks locally; this
+        # service never holds the placeholder→original map.
         def _to_cit_dicts(results, label):
             return [
                 {
                     "source":       label,
                     "section":      f"Chunk {r['chunk_idx'] + 1}",
                     "page":         r["chunk_idx"],
-                    "text":         _unmask(r["text"], payload.masked_items),
+                    "text":         r["text"],
                     "rerank_score": r["score"],
                 }
                 for r in results
             ]
 
+        # Telemetry records a fixed path string, NOT the returned one — the
+        # doc labels are client-supplied filenames, which the adversarial eval
+        # already treats as a PII carrier. Nothing user-derived leaves here.
+        record_telemetry("COMPARE", "Cloud Compare · Gemini",
+                         int((time.perf_counter() - _t0) * 1000))
+
         return CompareResponse(
-            answer        = answer,
+            answer        = raw_answer,
             path          = (
                 f"Cloud Compare · {payload.doc_a_label} vs "
                 f"{payload.doc_b_label} · Gemini"
@@ -356,7 +217,7 @@ async def handle_comparison(payload: CompareRequest):
                     "source":       c.source,
                     "section":      c.section,
                     "page":         c.page,
-                    "text":         _unmask(c.text, payload.masked_items),
+                    "text":         c.text,
                     "rerank_score": c.rerank_score,
                 }
                 for c in reg_citations

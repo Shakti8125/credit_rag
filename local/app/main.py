@@ -1,36 +1,39 @@
 import sys
-import os
 from pathlib import Path
-from dotenv import load_dotenv
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-load_dotenv(dotenv_path=_PROJECT_ROOT / "cloud" / "backend" / ".env")
+from shared.env import load_env
+from shared.logging_config import setup_logging, get_logger
 
-import io
+load_env()
+setup_logging()
+
 import time
-import logging
 import streamlit as st
 import requests
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# CONFIGURATION
-# ---------------------------------------------------------------------------
-API_ENDPOINT   = "http://127.0.0.1:8000/query"
-API_COMPARE    = "http://127.0.0.1:8000/compare"
-API_EWS        = "http://127.0.0.1:8000/ews"
-SLM_MODEL_PATH = r"C:\Users\Shakti\Desktop\credit-risk-rag_v_0.1\local\slm\models\phi3-basel-q4km.gguf"
+from local.app.styles import apply_theme
+from local.app.session import init_session_state
+from local.app.document_pipeline import process_uploaded_document, recompute_analytics
+from local.app.intent import classify_intent
+from local.app.ui_helpers import intent_chip
+from local.app.handlers.compare import handle_compare
+from local.app.handlers.ews import handle_ews
+from local.app.handlers.local_edge import handle_local_edge
+from local.app.handlers.cloud import handle_cloud
 
-_RERANK_POOL    = 20
-_PHI3_TOP_K     = 3
-_FAISS_POOL     = 15
-_CLOUD_TOP_K    = 5
-_CHUNK_CHAR_CAP = 1200
+from components.upload_panel        import render_upload_panel
+from components.model_toggle        import render_model_toggle
+from components.chat                import render_chat_interface
+from components.masking_log         import render_masking_log
+from components.financial_profile   import render_financial_profile
+from components.policy_breach_panel import render_policy_breach_panel
+from components.audit_trail         import render_audit_trail
 
 # ---------------------------------------------------------------------------
 # PAGE CONFIG — must be first Streamlit call
@@ -42,607 +45,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---------------------------------------------------------------------------
-# GLOBAL CSS — futuristic dark risk management theme
-# ---------------------------------------------------------------------------
-st.markdown("""
-<style>
-/* ── Base & fonts ─────────────────────────────────────────────── */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
-
-html, body, [class*="css"] {
-
-    font-family:'Inter',sans-serif;
-
-    background-color:var(--bg);
-    color:var(--text);
-
-}
-
-
-:root {
-
---bg:#ffffff;
---surface:#f8fafc;
---text:#111827;
---border:#e2e8f0;
---accent:#2563eb;
-
-}
-
-
-@media(prefers-color-scheme:dark){
-
-:root {
-
---bg:#0f172a;
---surface:#1e293b;
---text:#f8fafc;
---border:#334155;
---accent:#60a5fa;
-
-}
-
-}
-
-/* ── Sidebar ─────────────────────────────────────────────────── */
-[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #0a1628 0%, #0d1f3c 100%);
-    border-right: 1px solid #1a3a5c;
-}
-[data-testid="stSidebar"] .stMarkdown h1,
-[data-testid="stSidebar"] .stMarkdown h2,
-[data-testid="stSidebar"] .stMarkdown h3 {
-    color: #4fc3f7 !important;
-}
-[data-testid="stSidebar"] label { color: #8bafc8 !important; font-size: 0.78rem !important; letter-spacing: 0.04em; text-transform: uppercase; }
-[data-testid="stSidebar"] .stSelectbox > div > div { background: #0f1e35 !important; border: 1px solid #1e3a5c !important; color: #c8d8e8 !important; border-radius: 6px; }
-[data-testid="stSidebar"] .stRadio > div { gap: 6px; }
-[data-testid="stSidebar"] .stRadio label { color: #a0c0d8 !important; font-size: 0.85rem !important; text-transform: none !important; letter-spacing: 0 !important; }
-
-/* ── Main background ─────────────────────────────────────────── */
-.main .block-container {
-    background-color: #070d19;
-    padding-top: 1.5rem;
-    max-width: 1400px;
-}
-
-/* ── Headings ────────────────────────────────────────────────── */
-h1, h2, h3 { color: #4fc3f7 !important; font-weight: 600 !important; letter-spacing: -0.01em; }
-h1 { font-size: 1.6rem !important; }
-h2 { font-size: 1.25rem !important; }
-h3 { font-size: 1.05rem !important; }
-
-/* ── Metrics ─────────────────────────────────────────────────── */
-[data-testid="stMetric"] {
-    background: linear-gradient(135deg, #0d1f3c 0%, #0f2540 100%);
-    border: 1px solid #1e3a5c;
-    border-radius: 10px;
-    padding: 14px 18px;
-}
-[data-testid="stMetricLabel"] { color: #7ca8c8 !important; font-size: 0.72rem !important; text-transform: uppercase; letter-spacing: 0.08em; }
-[data-testid="stMetricValue"] { color: #4fc3f7 !important; font-size: 1.5rem !important; font-weight: 700 !important; font-family: 'JetBrains Mono', monospace !important; }
-
-/* ── Expanders ───────────────────────────────────────────────── */
-[data-testid="stExpander"] {
-    background: #0a1628 !important;
-    border: 1px solid #1a3355 !important;
-    border-radius: 10px !important;
-    margin-bottom: 8px !important;
-}
-[data-testid="stExpander"] summary {
-    color: #90caf9 !important;
-    font-weight: 500 !important;
-    font-size: 0.88rem !important;
-}
-
-/* ── Alerts ──────────────────────────────────────────────────── */
-[data-testid="stAlert"] { border-radius: 8px !important; border-left-width: 4px !important; }
-div[data-baseweb="notification"][kind="error"]   { background: #1a0a0a !important; border-color: #ef5350 !important; }
-div[data-baseweb="notification"][kind="warning"] { background: #1a1400 !important; border-color: #ffb74d !important; }
-div[data-baseweb="notification"][kind="success"] { background: #071a0e !important; border-color: #66bb6a !important; }
-div[data-baseweb="notification"][kind="info"]    { background: #051428 !important; border-color: #4fc3f7 !important; }
-
-/* ── Code / inline code ──────────────────────────────────────── */
-code {
-    background: #0f2236 !important;
-    color: #80d8ff !important;
-    border: 1px solid #1a3a5c !important;
-    border-radius: 4px !important;
-    font-family: 'JetBrains Mono', monospace !important;
-    font-size: 0.82em !important;
-    padding: 1px 5px !important;
-}
-
-/* ── Buttons ─────────────────────────────────────────────────── */
-.stButton > button {
-    background: linear-gradient(135deg, #0d47a1 0%, #1565c0 100%) !important;
-    color: #e3f2fd !important;
-    border: 1px solid #1976d2 !important;
-    border-radius: 8px !important;
-    font-weight: 500 !important;
-    letter-spacing: 0.02em !important;
-    transition: all 0.2s ease !important;
-}
-.stButton > button:hover {
-    background: linear-gradient(135deg, #1565c0 0%, #1976d2 100%) !important;
-    box-shadow: 0 0 16px rgba(79,195,247,0.25) !important;
-    transform: translateY(-1px) !important;
-}
-.stDownloadButton > button {
-    background: linear-gradient(135deg, #004d40 0%, #00695c 100%) !important;
-    color: #e0f2f1 !important;
-    border: 1px solid #00897b !important;
-    border-radius: 8px !important;
-}
-
-/* ── Chat messages ───────────────────────────────────────────── */
-[data-testid="stChatMessage"] {
-    background: #0a1628 !important;
-    border: 1px solid #1a3355 !important;
-    border-radius: 12px !important;
-    margin-bottom: 8px !important;
-}
-[data-testid="stChatMessageContent"] { color: #c8d8e8 !important; }
-
-/* ── Chat input ──────────────────────────────────────────────── */
-[data-testid="stChatInput"] > div {
-    background: #0d1f3c !important;
-    border: 1px solid #1e3a5c !important;
-    border-radius: 12px !important;
-}
-[data-testid="stChatInput"] textarea {
-    color: #c8d8e8 !important;
-    background: transparent !important;
-}
-[data-testid="stChatInput"] textarea::placeholder { color: #4a6a88 !important; }
-
-/* ── File uploader ───────────────────────────────────────────── */
-[data-testid="stFileUploader"] {
-    background: #0a1628 !important;
-    border: 1px dashed #1e3a5c !important;
-    border-radius: 10px !important;
-    padding: 8px !important;
-}
-[data-testid="stFileUploader"] label { color: #7ca8c8 !important; }
-
-/* ── Dividers ────────────────────────────────────────────────── */
-hr { border-color: #1a3355 !important; }
-
-/* ── Spinner ─────────────────────────────────────────────────── */
-[data-testid="stSpinner"] > div { border-top-color: #4fc3f7 !important; }
-
-/* ── Caption ─────────────────────────────────────────────────── */
-.stCaption, [data-testid="stCaptionContainer"] { color: #5a8aaa !important; font-size: 0.78rem !important; }
-
-/* ── Scrollbar ───────────────────────────────────────────────── */
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: #070d19; }
-::-webkit-scrollbar-thumb { background: #1e3a5c; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #2a5080; }
-
-/* ── Status badge pill ───────────────────────────────────────── */
-.status-pill {
-    display: inline-block;
-    padding: 2px 10px;
-    border-radius: 20px;
-    font-size: 0.72rem;
-    font-weight: 600;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-}
-.pill-active { background: #0a3320; color: #66bb6a; border: 1px solid #2e7d32; }
-.pill-idle   { background: #1a1a2e; color: #7986cb; border: 1px solid #3949ab; }
-.pill-warn   { background: #1a0f00; color: #ffb74d; border: 1px solid #e65100; }
-.pill-breach { background: #1a0505; color: #ef5350; border: 1px solid #b71c1c; }
-
-/* ── Header banner ───────────────────────────────────────────── */
-.header-banner {
-    background: linear-gradient(90deg, #071428 0%, #0d2040 50%, #071428 100%);
-    border: 1px solid #1a3a5c;
-    border-radius: 12px;
-    padding: 16px 24px;
-    margin-bottom: 20px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-}
-.header-title {
-    font-size: 1.3rem;
-    font-weight: 700;
-    color: #4fc3f7;
-    letter-spacing: -0.02em;
-}
-.header-sub {
-    font-size: 0.75rem;
-    color: #4a7a9b;
-    margin-top: 2px;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-}
-.header-badge {
-    font-size: 0.7rem;
-    color: #4fc3f7;
-    border: 1px solid #1a5276;
-    border-radius: 6px;
-    padding: 4px 10px;
-    font-family: 'JetBrains Mono', monospace;
-}
-
-/* ── Intent badge ────────────────────────────────────────────── */
-.intent-chip {
-    display: inline-block;
-    padding: 3px 12px;
-    border-radius: 20px;
-    font-size: 0.68rem;
-    font-weight: 700;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    margin-left: 8px;
-    vertical-align: middle;
-}
-.chip-extract   { background: #0a2040; color: #64b5f6; border: 1px solid #1565c0; }
-.chip-hybrid    { background: #1a0a30; color: #ce93d8; border: 1px solid #7b1fa2; }
-.chip-general   { background: #0a1a10; color: #81c784; border: 1px solid #2e7d32; }
-.chip-benchmark { background: #1a1000; color: #ffcc02; border: 1px solid #f57f17; }
-.chip-compare   { background: #001a1a; color: #4dd0e1; border: 1px solid #00838f; }
-.chip-ews       { background: #1a0a0a; color: #ef9a9a; border: 1px solid #c62828; }
-
-/* ── Panel section header ────────────────────────────────────── */
-.panel-section {
-    font-size: 0.68rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.12em;
-    color: #3a6a8a;
-    margin: 16px 0 6px 0;
-    padding-bottom: 4px;
-    border-bottom: 1px solid #0f2236;
-}
-</style>
-""", unsafe_allow_html=True)
-
-
-# ---------------------------------------------------------------------------
-# CACHED RESOURCES
-# ---------------------------------------------------------------------------
-
-@st.cache_resource(show_spinner="Initialising privacy pipeline…")
-def load_privacy_pipeline():
-    from local.privacy.pipeline import PrivacyPipeline
-    return PrivacyPipeline(spacy_model="en_core_web_lg")
-
-
-@st.cache_resource(show_spinner="Loading Phi-3 GGUF…")
-def load_inference_engine():
-    try:
-        from local.slm.inference import LocalModelInference
-        return LocalModelInference(model_path=SLM_MODEL_PATH, ctx_size=4096, gpu_layers=0)
-    except (FileNotFoundError, ImportError) as e:
-        logger.info("Local inference unavailable: %s", e)
-        return None
-
-
-@st.cache_resource(show_spinner="Loading embedding model…")
-def load_embedding_model():
-    try:
-        from sentence_transformers import SentenceTransformer
-        return SentenceTransformer("all-MiniLM-L6-v2")
-    except ImportError:
-        return None
-
-
-@st.cache_resource(show_spinner="Connecting to Pinecone…")
-def load_pinecone_retriever():
-    try:
-        from local.rag.pinecone_index import PineconeRetriever
-        return PineconeRetriever()
-    except Exception as e:
-        logger.warning("PineconeRetriever: %s", e)
-        return None
-
-
-@st.cache_resource(show_spinner="Loading cross-encoder…")
-def load_reranker():
-    try:
-        from local.rag.reranker import CrossEncoderReranker
-        return CrossEncoderReranker()
-    except Exception as e:
-        logger.warning("CrossEncoderReranker: %s", e)
-        return None
-
-
-# ---------------------------------------------------------------------------
-# COMPONENT IMPORTS
-# ---------------------------------------------------------------------------
-from components.upload_panel        import render_upload_panel
-from components.model_toggle        import render_model_toggle
-from components.chat                import render_chat_interface
-from components.masking_log         import render_masking_log
-from components.citations           import render_citations
-from components.financial_profile   import render_financial_profile
-from components.policy_breach_panel import render_policy_breach_panel
-from components.audit_trail         import render_audit_trail
-
-# ---------------------------------------------------------------------------
-# SESSION STATE
-# ---------------------------------------------------------------------------
-_DEFAULTS = {
-    "last_execution_path":  "Idle",
-    "last_citations":       [],
-    "last_intent":          "GENERAL",
-
-    # Only masked words and original values
-    # No financial values stored
-    "mask_dictionary":      {},
-
-    "doc_text":             None,
-    "doc_faiss_index":      None,
-    "registry":             None,
-    "last_uploaded_file":   None,
-    "messages":             [],
-    "last_execution_time":  None,
-    "financial_profile":    None,
-    "breach_report":        None,
-    "audit_trail":          [],
-    "analysis_mode":        "Standard",
-    "doc_b_text":           None,
-    "doc_b_label":          None,
-    "doc_b_faiss_index":    None,
-    "ews_report":           None,
-    "ews_cloud_result":     None,
-}
-
-for k, v in _DEFAULTS.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-
-# ---------------------------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------------------------
-
-def stream_response(text: str):
-    if not text:
-        yield "Error: Empty response."
-        return
-    for word in text.split(" "):
-        yield word + " "
-        time.sleep(0.03)
-
-
-
-
-def _unmask_response(text: str) -> str:
-    """Unmask STRICTLY after LLM generation — never before."""
-    registry = st.session_state.get("registry")
-    if registry is not None:
-        return registry.unmask_text(text)
-    mapping = st.session_state.get("mask_dictionary", {})
-    for ph in sorted(mapping.keys(), key=len, reverse=True):
-        text = text.replace(ph, mapping[ph])
-    return text
-
-
-def _intent_chip(intent: str) -> str:
-    classes = {
-        "EXTRACT": "chip-extract", "HYBRID": "chip-hybrid",
-        "GENERAL": "chip-general", "BENCHMARK": "chip-benchmark",
-        "COMPARE": "chip-compare", "EWS": "chip-ews",
-    }
-    cls = classes.get(intent, "chip-general")
-    return f'<span class="intent-chip {cls}">{intent}</span>'
-
-
-def process_uploaded_document(uploaded_file, slot: str = "primary") -> bool:
-    pipeline = load_privacy_pipeline()
-    if pipeline is None:
-        st.error("🚨 Privacy pipeline failed to initialise.")
-        return False
-
-    doc_type = st.session_state.get("document_type", "Internal Credit Proposal (Memo)")
-
-    try:
-        result = pipeline.process_document(
-            file_source=io.BytesIO(uploaded_file.getvalue()),
-            filename=uploaded_file.name,
-            doc_type=doc_type,
-        )
-
-        registry = result.get("registry_instance")
-
-        if registry:
-            mask_dictionary = registry.get_mask_dictionary()
-        else:
-            mask_dictionary = {
-                e["placeholder"]: e["original_entity"]
-                for e in result.get("audit_log", [])
-            }
-
-        if slot == "primary":
-            st.session_state["doc_text"]             = result["masked_text"]
-            st.session_state["mask_dictionary"] = mask_dictionary
-            st.session_state["last_uploaded_file"]   = uploaded_file.name
-            st.session_state["registry"]             = result["registry_instance"]
-            st.session_state["financial_profile"]    = result.get("financial_profile")
-            st.session_state["breach_report"]        = result.get("breach_report")
-            st.session_state["ews_report"]           = result.get("ews_report")
-            st.session_state["ews_cloud_result"]     = None
-
-            embed_model = load_embedding_model()
-            if embed_model:
-                from local.rag.chunker     import MarkdownChunker
-                from local.rag.local_index import LocalDocumentIndex
-                chunks = MarkdownChunker().chunk(result["masked_text"])
-                if chunks:
-                    idx = LocalDocumentIndex(embed_model)
-                    idx.build(chunks)
-                    st.session_state["doc_faiss_index"] = idx
-        else:
-            st.session_state["doc_b_text"]  = result["masked_text"]
-            st.session_state["doc_b_label"] = uploaded_file.name
-            embed_model = load_embedding_model()
-            if embed_model:
-                from local.rag.chunker     import MarkdownChunker
-                from local.rag.local_index import LocalDocumentIndex
-                chunks = MarkdownChunker().chunk(result["masked_text"])
-                if chunks:
-                    idx = LocalDocumentIndex(embed_model)
-                    idx.build(chunks)
-                    st.session_state["doc_b_faiss_index"] = idx
-
-        logger.info(
-            "Doc processed [%s]: %d entities masked, %d financials",
-            slot, len(mask_dictionary),
-        )
-        return True
-
-    except Exception as e:
-        from local.privacy.validator import LeakageValidationError
-        if isinstance(e, LeakageValidationError):
-            st.error(f"🚨 Egress firewall blocked: {e}")
-        else:
-            st.error(f"🚨 Document processing failed: {e}")
-        logger.error("Pipeline error [%s] %s: %s", slot, uploaded_file.name, e, exc_info=True)
-        return False
-
-
-# ---------------------------------------------------------------------------
-# RETRIEVAL
-# ---------------------------------------------------------------------------
-
-def _retrieve_doc_chunks(query: str, top_k: int = _PHI3_TOP_K,
-                          for_cloud: bool = False,
-                          faiss_key: str = "doc_faiss_index") -> tuple:
-    effective_top_k = _CLOUD_TOP_K if for_cloud else top_k
-    faiss_index     = st.session_state.get(faiss_key)
-    reranker        = load_reranker()
-
-    if faiss_index is None or not faiss_index.is_built:
-        return _keyword_fallback(query)
-
-    pool = faiss_index.search(query, top_k=_FAISS_POOL)
-
-    if reranker is not None and len(pool) > 1:
-        ranked = reranker.rerank(query, pool, top_k=effective_top_k)
-    else:
-        ranked = [(c, s) for c, s in pool[:effective_top_k]]
-
-    if not ranked:
-        return _keyword_fallback(query)
-
-    chunk_texts, citations = [], []
-    for i, (chunk, score) in enumerate(ranked, 1):
-        header = f"[Section: {chunk.section}] " if chunk.section else ""
-        text   = chunk.text if for_cloud else chunk.text[:_CHUNK_CHAR_CAP]
-        chunk_texts.append(f"Chunk {i} {header}(score {score:.3f}):\n{text}")
-        citations.append({
-            "section": chunk.section or "Document",
-            "text":    chunk.text,
-            "score":   round(score, 3),
-            "page":    f"Chunk {chunk.index + 1} of {faiss_index.chunk_count}",
-        })
-
-    context = "\n\n---\n\n".join(chunk_texts)
-    if for_cloud:
-        return context, citations
-
-    return (
-        "System: You are a credit risk analyst. "
-        "Answer using ONLY the chunks below. Be concise — 3-4 sentences.\n\n"
-        f"Document Chunks (top-{effective_top_k}, reranked):\n\n{context}\n\n"
-    ), citations
-
-
-def _retrieve_regulatory_chunks(query: str, top_k: int = _PHI3_TOP_K) -> tuple:
-    pinecone = load_pinecone_retriever()
-    reranker = load_reranker()
-
-    if pinecone is None:
-        return "", []
-
-    pool = pinecone.search(query, top_k=_RERANK_POOL)
-
-    if reranker is not None and len(pool) > 1:
-        ranked = reranker.rerank(query, pool, top_k=top_k)
-    else:
-        ranked = [(c, 0.0) for c in pool[:top_k]]
-
-    if not ranked:
-        return "", []
-
-    chunk_texts, citations = [], []
-    for i, (chunk, score) in enumerate(ranked, 1):
-        header = f"[{chunk.section}] " if chunk.section else ""
-        chunk_texts.append(f"Chunk {i} {header}(score {score:.3f}):\n{chunk.text}")
-        citations.append({
-            "section": chunk.section or "Regulatory Corpus",
-            "text":    chunk.text,
-            "score":   round(score, 3),
-            "page":    f"Chunk {chunk.index + 1}",
-        })
-
-    context = "\n\n---\n\n".join(chunk_texts)
-    return f"Regulatory Chunks (top-{top_k}, reranked):\n\n{context}\n\n", citations
-
-
-def _keyword_fallback(query: str) -> tuple:
-    doc_text   = st.session_state.get("doc_text") or ""
-    paragraphs = [p.strip() for p in doc_text.split("\n\n") if p.strip()]
-    STOP       = {"what","is","the","a","an","of","in","this","about","are",
-                  "how","does","do","which","can","be","to","and"}
-    keywords   = {w.lower() for w in query.split() if w.lower() not in STOP and len(w) > 2}
-    scored     = sorted(
-        paragraphs,
-        key=lambda p: len(keywords & {w.lower().strip(".,;:()[]") for w in p.split()}),
-        reverse=True,
-    )
-    words: list = []
-    for para in scored:
-        ws = para.split()
-        if len(words) + len(ws) > 500:
-            break
-        words.extend(ws)
-    excerpt = " ".join(words) if words else " ".join(doc_text.split()[:500])
-    return (
-        "System: You are a credit risk analyst. Answer based on the excerpt below. "
-        "Be concise.\n\nDocument Excerpt:\n" + excerpt + "\n\n"
-    ), []
-
-
-# ---------------------------------------------------------------------------
-# INTENT CLASSIFIER
-# ---------------------------------------------------------------------------
-
-def classify_intent(prompt: str, document_attached: bool, selected_model: str) -> str:
-    mode = st.session_state.get("analysis_mode", "Standard")
-    if mode == "Compare Two Documents":
-        return "COMPARE"
-    if mode == "Early Warning Scan":
-        return "EWS"
-
-    if selected_model == "Phi-3 (Local Edge)":
-        if not document_attached:
-            return "GENERAL"
-        HYBRID_SIGNALS = {
-            "compare","versus","vs","benchmark","exceed","below","above","breach",
-            "guideline","policy","requirement","comply","compliance","threshold",
-            "limit","minimum","maximum","cbuae","basel","rbi","ifrs","eba","bcbs",
-        }
-        return "HYBRID" if set(prompt.lower().split()) & HYBRID_SIGNALS else "EXTRACT"
-
-    if not document_attached:
-        return "BENCHMARK"
-
-    HYBRID_SIGNALS = {
-        "compare","versus","vs","benchmark","exceed","below","above","breach",
-        "guideline","policy","requirement","comply","compliance","threshold",
-        "limit","minimum","maximum","cbuae","basel","rbi","ifrs","eba","bcbs",
-    }
-    intent = "HYBRID" if set(prompt.lower().split()) & HYBRID_SIGNALS else "EXTRACT"
-    logger.info("Intent='%s' doc=%s model=%s", intent, document_attached, selected_model)
-    return intent
-
+apply_theme()
+init_session_state()
 
 # ---------------------------------------------------------------------------
 # SIDEBAR
@@ -651,7 +55,7 @@ with st.sidebar:
     # Brand mark
     st.markdown("""
     <div style="padding: 12px 0 20px 0;">
-        <div style="font-size:1.2rem;font-weight:700;color:#4fc3f7;letter-spacing:-0.02em;">
+        <div style="font-size:1.2rem;font-weight:700;color:#22d3ee;letter-spacing:-0.02em;">
             🛡️ CreditRAG
         </div>
         <div style="font-size:0.65rem;color:#3a6a8a;text-transform:uppercase;letter-spacing:0.12em;margin-top:2px;">
@@ -678,8 +82,23 @@ with st.sidebar:
 
     mode = st.session_state.get("analysis_mode", "Standard")
 
-    # Process primary document
-    if primary_file and st.session_state["last_uploaded_file"] != primary_file.name:
+    # Document Type changed after upload → re-run analytics (extraction,
+    # policy check, EWS) on the stored raw text with the new type. Fast:
+    # no re-extraction, re-masking, or re-indexing.
+    _current_doc_type = st.session_state.get("document_type")
+    if (
+        st.session_state.get("doc_raw_text")
+        and st.session_state.get("doc_type_used") not in (None, _current_doc_type)
+    ):
+        with st.spinner("Re-running analysis for new document type…"):
+            if recompute_analytics(_current_doc_type):
+                st.success("✅ Analysis updated for new document type")
+                st.rerun()
+
+    # Process primary document — guard compares the RAW filename;
+    # last_uploaded_file holds the MASKED name and would never match,
+    # reprocessing the document on every rerun.
+    if primary_file and st.session_state.get("last_uploaded_raw_name") != primary_file.name:
         with st.spinner(f"Processing {primary_file.name}…"):
             ok = process_uploaded_document(primary_file, slot="primary")
         if ok:
@@ -700,7 +119,7 @@ with st.sidebar:
     if (
         mode == "Compare Two Documents"
         and secondary_file
-        and st.session_state.get("doc_b_label") != secondary_file.name
+        and st.session_state.get("doc_b_raw_name") != secondary_file.name
     ):
         with st.spinner(f"Processing {secondary_file.name}…"):
             ok = process_uploaded_document(secondary_file, slot="secondary")
@@ -815,7 +234,7 @@ with col1:
     if last_intent:
         st.markdown(
             f'<div style="margin-bottom:8px;font-size:0.75rem;color:#4a7a9b;">Last intent: '
-            f'{_intent_chip(last_intent)}</div>',
+            f'{intent_chip(last_intent)}</div>',
             unsafe_allow_html=True,
         )
 
@@ -825,11 +244,11 @@ with col1:
         document_attached = bool(st.session_state["doc_text"])
         intent = classify_intent(prompt, document_attached, selected_model)
 
-        # Block Phi-3 for Tier 2 intents
-        if intent in ("COMPARE", "EWS") and selected_model == "Phi-3 (Local Edge)":
+        # Block the local tier for Tier 2 intents
+        if intent in ("COMPARE", "EWS") and selected_model == "local":
             st.warning(
                 "⚠️ **Compare** and **EWS** modes are cloud-only. "
-                "Switch to **Gemini Pro (Cloud)** in the sidebar."
+                "Switch to **Cloud** in the sidebar."
             )
             st.stop()
 
@@ -838,190 +257,14 @@ with col1:
                 with st.spinner("Analysing…"):
                     start_time = time.time()
 
-                    # ====================================================
-                    # COMPARE
-                    # ====================================================
                     if intent == "COMPARE":
-                        doc_a_text = st.session_state.get("doc_text") or ""
-                        doc_b_text = st.session_state.get("doc_b_text") or ""
-
-                        if not doc_a_text:
-                            answer_text = "⚠️ Upload **Document A** first (primary upload slot)."
-                            st.warning(answer_text)
-                        elif not doc_b_text:
-                            answer_text = "⚠️ Upload **Document B** (second slot appears in Compare mode)."
-                            st.warning(answer_text)
-                        else:
-                            doc_a_label = st.session_state.get("last_uploaded_file", "Document A")
-                            doc_b_label = st.session_state.get("doc_b_label", "Document B")
-                            st.caption(f"Sending both documents to Gemini for structured comparison…")
-                            logger.info(
-                                "COMPARE | A='%s' %d chars | B='%s' %d chars",
-                                doc_a_label, len(doc_a_text),
-                                doc_b_label, len(doc_b_text),
-                            )
-                            payload = {
-                                "query":             prompt,
-                                "doc_a_text":        doc_a_text,
-                                "doc_b_text":        doc_b_text,
-                                "doc_a_label":       doc_a_label,
-                                "doc_b_label":       doc_b_label,
-                                "doc_type":          st.session_state.get("document_type", "Document"),
-                                "masked_items":      st.session_state["mask_dictionary"],
-                                "include_regulatory": True,
-                            }
-                            resp = requests.post(API_COMPARE, json=payload, timeout=300)
-                            if resp.status_code == 200:
-                                data        = resp.json()
-                                answer_text = _unmask_response(data.get("answer", ""))
-                                st.session_state["last_execution_path"] = data.get("path", "Cloud Compare")
-                                st.session_state["last_citations"]      = data.get("citations_a", []) + data.get("citations_b", [])
-                                st.write_stream(stream_response(answer_text))
-                                # Citation viewer
-                                ca = data.get("citations_a", [])
-                                cb = data.get("citations_b", [])
-                                if ca or cb:
-                                    st.markdown("---")
-                                    ca_col, cb_col = st.columns(2)
-                                    with ca_col:
-                                        st.markdown(f"**📄 {doc_a_label}**")
-                                        for i, c in enumerate(ca[:4], 1):
-                                            with st.expander(f"Chunk {i} · score {c.get('rerank_score','?')}", expanded=False):
-                                                st.write(c.get("text", "")[:400])
-                                    with cb_col:
-                                        st.markdown(f"**📄 {doc_b_label}**")
-                                        for i, c in enumerate(cb[:4], 1):
-                                            with st.expander(f"Chunk {i} · score {c.get('rerank_score','?')}", expanded=False):
-                                                st.write(c.get("text", "")[:400])
-                            else:
-                                answer_text = f"API Error {resp.status_code}: {resp.text}"
-                                st.error(answer_text)
-
-                    # ====================================================
-                    # EWS
-                    # ====================================================
+                        answer_text = handle_compare(prompt)
                     elif intent == "EWS":
-                        doc_text = st.session_state.get("doc_text") or ""
-                        if not doc_text:
-                            answer_text = "⚠️ Upload a document before running an EWS scan."
-                            st.warning(answer_text)
-                        else:
-                            st.caption("Running deep early warning scan via Gemini…")
-                            ews_report = st.session_state.get("ews_report")
-                            local_sigs = ews_report.to_dict().get("signals", []) if ews_report else []
-                            payload = {
-                                "doc_text":     doc_text,
-                                "doc_label":    st.session_state.get("last_uploaded_file", "Document"),
-                                "doc_type":     st.session_state.get("document_type", "Document"),
-                                "masked_items": st.session_state["mask_dictionary"],
-                                "local_signals": local_sigs,
-                                "query":        prompt,
-                            }
-                            resp = requests.post(API_EWS, json=payload, timeout=300)
-                            if resp.status_code == 200:
-                                data        = resp.json()
-                                answer_text = _unmask_response(data.get("answer", ""))
-                                st.session_state["ews_cloud_result"]    = answer_text
-                                st.session_state["last_execution_path"] = data.get("path", "Cloud EWS")
-                                st.session_state["last_citations"]      = data.get("citations", [])
-                                st.write_stream(stream_response(answer_text))
-                                render_citations("HYBRID", data.get("citations", []))
-                            else:
-                                answer_text = f"API Error {resp.status_code}: {resp.text}"
-                                st.error(answer_text)
-
-                    # ====================================================
-                    # LOCAL EDGE — Phi-3
-                    # ====================================================
-                    elif selected_model == "Phi-3 (Local Edge)":
-                        engine, local_citations = load_inference_engine(), []
-
-                        if engine is None:
-                            answer_text = (
-                                "⚠️ Local inference unavailable. "
-                                f"Ensure the GGUF model exists at `{SLM_MODEL_PATH}`."
-                            )
-                        else:
-                            if intent == "EXTRACT":
-                                st.caption("Retrieving from document (FAISS + cross-encoder)…")
-                                doc_context, local_citations = _retrieve_doc_chunks(prompt)
-                                reg_context = ""
-                            elif intent == "HYBRID":
-                                st.caption("Retrieving from document and regulatory corpus…")
-                                doc_context, dc = _retrieve_doc_chunks(prompt)
-                                reg_context, rc = _retrieve_regulatory_chunks(prompt)
-                                local_citations = dc + rc
-                            else:
-                                st.caption("Retrieving from regulatory corpus (Pinecone)…")
-                                doc_context = ""
-                                reg_context, local_citations = _retrieve_regulatory_chunks(prompt)
-
-                            system_prefix = (
-                                "System: You are a credit risk analyst. "
-                                "Answer only within credit risk, banking regulation, and financial analysis. "
-                                "Be concise — 3-4 sentences.\n\n"
-                            )
-                            if intent == "EXTRACT" and doc_context:
-                                ctx = doc_context
-                            elif intent == "HYBRID":
-                                parts = []
-                                if doc_context: parts.append(f"Document:\n{doc_context}")
-                                if reg_context: parts.append(f"Regulatory:\n{reg_context}")
-                                ctx = "\n\n".join(parts)
-                            else:
-                                ctx = f"Regulatory:\n{reg_context}" if reg_context else ""
-
-                            slm_prompt  = f"<|user|>\n{system_prefix}{ctx}Question: {prompt}\n<|end|>\n<|assistant|>"
-                            st.caption("Generating via Phi-3…")
-                            raw_answer  = engine.run_inference(slm_prompt, max_tokens=512)
-                            answer_text = _unmask_response(f"*(Local Edge — {intent})* {raw_answer}")
-
-                        st.session_state["last_execution_path"] = f"Local Edge · Phi-3 · {intent}"
-                        st.session_state["last_citations"]      = local_citations
-                        st.session_state["last_intent"]         = intent
-                        st.write_stream(stream_response(answer_text))
-                        render_citations(intent, local_citations)
-
-                    # ====================================================
-                    # CLOUD — Gemini Pro
-                    # ====================================================
+                        answer_text = handle_ews(prompt)
+                    elif selected_model == "local":
+                        answer_text = handle_local_edge(prompt, intent)
                     else:
-                        doc_payload_text, cloud_doc_citations = "", []
-                        if document_attached and intent in ("EXTRACT", "HYBRID"):
-                            st.caption("Retrieving relevant chunks from document (FAISS)…")
-                            doc_payload_text, cloud_doc_citations = _retrieve_doc_chunks(
-                                prompt, for_cloud=True
-                            )
-
-                        payload = {
-                            "query":        prompt,
-                            "intent":       intent,
-                            "doc_text":     doc_payload_text,
-                            "masked_items": st.session_state["mask_dictionary"],
-                            "doc_type":     st.session_state.get("document_type", "Document"),
-                        }
-
-                        logger.info(
-                            "Cloud payload | intent=%s doc_preview=%s masked=%d",
-                            intent,
-                            (doc_payload_text or "")[:120],
-                            len(st.session_state["mask_dictionary"]),
-                        )
-
-                        st.caption("Routing to Gemini via FastAPI…")
-                        resp = requests.post(API_ENDPOINT, json=payload, timeout=120)
-
-                        if resp.status_code == 200:
-                            data        = resp.json()
-                            answer_text = _unmask_response(data.get("answer", ""))
-                            st.session_state["last_execution_path"] = data.get("path", "Cloud")
-                            st.session_state["last_citations"]      = cloud_doc_citations + data.get("citations", [])
-                            st.session_state["last_intent"]         = intent
-                            st.write_stream(stream_response(answer_text))
-                            render_citations(intent, st.session_state["last_citations"])
-                        else:
-                            answer_text = f"API Error {resp.status_code}: {resp.text}"
-                            st.error(answer_text)
+                        answer_text = handle_cloud(prompt, intent, document_attached)
 
                     # ── TIMING + AUDIT TRAIL ──────────────────────────
                     elapsed = round(time.time() - start_time, 2)

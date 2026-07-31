@@ -17,9 +17,9 @@ from pathlib import Path
 from typing import Dict, Any, Union
 
 from local.privacy.extractor       import DocumentExtractor
-from local.privacy.entity_registry import EntityRegistry
 from local.privacy.masker          import DocumentMasker
 from local.privacy.validator       import DocumentValidator
+from shared.masking                import EntityRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +106,15 @@ class PrivacyPipeline:
         # ── Phase 2: Masking ───────────────────────────────────────────
         logger.info("Phase 2/4: PII masking…")
         masked_text = self.masker.mask(raw_text)
+
+        # EWS signal excerpts are verbatim snippets of RAW text (Phase 4 runs
+        # pre-mask so values are intact) and are later sent to the cloud in
+        # /ews payloads — mask them here so they can never leak. Placeholders
+        # stay registry-consistent with the document body.
+        if ews_report is not None:
+            for sig in ews_report.signals:
+                if sig.excerpt:
+                    sig.excerpt = self.masker.mask(sig.excerpt)
         logger.info("Phase 2 done.")
 
         # ── Phase 3: Egress firewall ───────────────────────────────────

@@ -1,0 +1,22 @@
+# Cloud tier (FastAPI backend) — deployable standalone with shared/
+fastapi
+uvicorn[standard]
+mangum
+pydantic
+python-dotenv
+boto3
+
+# Generation
+google-genai
+
+# Retrieval
+pinecone
+sentence-transformers
+faiss-cpu
+numpy
+
+# Token gating (doc_injector)
+tiktoken
+
+# Ingestion scripts only (1_extract_and_chunk.py)
+docling

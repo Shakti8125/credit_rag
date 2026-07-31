@@ -1,0 +1,46 @@
+# Offline evaluation gate — runs the suites that need no live backend or
+# paid API key: privacy (masking leakage), adversarial (masking robustness),
+# retrieval (BM25 path; dense/hybrid rows are skipped without torch to keep
+# CI fast). The e2e + LLM-judge suite runs locally / pre-release via:
+#     python eval/run_all.py --api http://127.0.0.1:8000 --judge
+
+name: eval
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  offline-evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install eval dependencies (masking stack only)
+        run: |
+          pip install spacy python-dotenv requests
+          python -m spacy download en_core_web_lg
+
+      - name: Privacy eval (blocking)
+        run: python eval/privacy_eval.py
+
+      - name: Adversarial masking eval (blocking)
+        run: python eval/adversarial_eval.py
+
+      - name: Retrieval eval (BM25 path, blocking)
+        run: python eval/retrieval_eval.py
+
+      - name: Upload eval reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-reports
+          path: eval/reports/
+          if-no-files-found: ignore

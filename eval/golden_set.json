@@ -1,0 +1,121 @@
+{
+  "description": "Gold question set for e2e answer-quality evaluation. Grounded in the Pinecone regulatory corpus (CBUAE CAR/MMG/Standards, Basel ECL, IFRS 9, market/operational/climate risk). reference_answer is used by the LLM judge for correctness scoring; expect_terms is an any-of lexical check; must_terms (optional) is an all-of check.",
+  "questions": [
+    {
+      "id": "capital-min-car",
+      "category": "capital_adequacy",
+      "intent": "BENCHMARK",
+      "query": "What is the minimum total capital adequacy ratio a bank must maintain under Basel III?",
+      "expect_terms": ["10.5", "capital"],
+      "must_terms": ["capital"],
+      "reference_answer": "Under Basel III, banks must maintain a minimum total capital ratio of 8% of risk-weighted assets, which rises to 10.5% including the 2.5% capital conservation buffer. Within this, Common Equity Tier 1 must be at least 4.5% (7% including the buffer) and Tier 1 capital at least 6%."
+    },
+    {
+      "id": "capital-cet1",
+      "category": "capital_adequacy",
+      "intent": "BENCHMARK",
+      "query": "What is the minimum Common Equity Tier 1 ratio including the capital conservation buffer?",
+      "expect_terms": ["7", "cet1", "common equity"],
+      "reference_answer": "The minimum Common Equity Tier 1 (CET1) requirement is 4.5% of risk-weighted assets; adding the 2.5% capital conservation buffer brings the effective CET1 minimum to 7%."
+    },
+    {
+      "id": "ifrs9-stage2",
+      "category": "ifrs9",
+      "intent": "BENCHMARK",
+      "query": "When must a financial asset be moved to Stage 2 under IFRS 9?",
+      "expect_terms": ["significant increase", "credit risk", "sicr"],
+      "must_terms": ["credit risk"],
+      "reference_answer": "A financial asset moves to Stage 2 when there has been a significant increase in credit risk (SICR) since initial recognition, but the asset is not yet credit-impaired. From that point lifetime expected credit losses must be recognised instead of 12-month ECL. Indicators include ratings downgrades, watch-list placement, and the 30-days-past-due rebuttable presumption."
+    },
+    {
+      "id": "ifrs9-ecl-formula",
+      "category": "ifrs9",
+      "intent": "BENCHMARK",
+      "query": "How is expected credit loss computed under IFRS 9?",
+      "expect_terms": ["pd", "lgd", "ead"],
+      "reference_answer": "Expected credit loss under IFRS 9 is computed as PD x LGD x EAD (probability of default times loss given default times exposure at default), discounted at the effective interest rate. The estimate must be probability-weighted across forward-looking macroeconomic scenarios, using 12-month ECL for Stage 1 assets and lifetime ECL for Stage 2 and 3."
+    },
+    {
+      "id": "ifrs9-stage3",
+      "category": "ifrs9",
+      "intent": "BENCHMARK",
+      "query": "What defines a Stage 3 credit-impaired asset under IFRS 9?",
+      "expect_terms": ["impair", "default", "stage 3"],
+      "reference_answer": "Stage 3 assets are credit-impaired: one or more events with a detrimental impact on estimated future cash flows have occurred, such as significant financial difficulty of the obligor, default or past-due status (typically 90 days), concessions granted due to financial difficulty, or probable bankruptcy. Lifetime ECL is recognised and interest is accrued on the net carrying amount."
+    },
+    {
+      "id": "mmg-validation",
+      "category": "model_risk",
+      "intent": "BENCHMARK",
+      "query": "What does the CBUAE require for the validation of credit rating models?",
+      "expect_terms": ["validation", "model"],
+      "must_terms": ["validation"],
+      "reference_answer": "The CBUAE Model Management Guidelines require banks to validate rating models regularly (at least annually), independently of model development. Validation must cover discriminatory power, calibration accuracy, and stability of the model population, with findings reported to governance committees and remediation tracked."
+    },
+    {
+      "id": "market-risk-approach",
+      "category": "market_risk",
+      "intent": "BENCHMARK",
+      "query": "What approaches are available for calculating market risk capital requirements under the CBUAE standards?",
+      "expect_terms": ["market risk", "standardised", "standardized", "internal model"],
+      "reference_answer": "Market risk capital may be calculated under the standardised approach — with prescribed charges for interest-rate, equity, foreign-exchange, commodity, and options risk — or, with supervisory approval, under an internal models approach. The CBUAE standards set out the standardised measurement method as the default."
+    },
+    {
+      "id": "ltv-limits",
+      "category": "credit_policy",
+      "intent": "BENCHMARK",
+      "query": "What loan-to-value limits apply to real estate financing?",
+      "expect_terms": ["ltv", "loan-to-value"],
+      "reference_answer": "CBUAE mortgage regulations cap loan-to-value ratios for residential mortgages — for UAE nationals 85% for a first property (80% for expatriates), lower for subsequent and investment properties, and commercial real estate exposures are generally capped around 75% LTV under prudential norms."
+    },
+    {
+      "id": "oprisk-definition",
+      "category": "operational_risk",
+      "intent": "BENCHMARK",
+      "query": "How is operational risk defined and what does its capital charge cover?",
+      "expect_terms": ["operational risk", "process", "people", "systems"],
+      "reference_answer": "Operational risk is the risk of loss resulting from inadequate or failed internal processes, people and systems, or from external events; the definition includes legal risk but excludes strategic and reputational risk. The capital charge covers losses from such events, calculated under the Basel standardised approaches."
+    },
+    {
+      "id": "climate-risk",
+      "category": "climate_risk",
+      "intent": "BENCHMARK",
+      "query": "What are physical risk and transition risk in the context of climate-related financial risk?",
+      "expect_terms": ["physical", "transition"],
+      "must_terms": ["physical", "transition"],
+      "reference_answer": "Physical risk is the risk of financial loss from climate and weather events — both acute (floods, storms, heatwaves) and chronic (sea-level rise, sustained temperature shifts) — damaging assets and disrupting operations. Transition risk arises from the adjustment to a low-carbon economy: policy and legal changes, technology shifts, and changing market sentiment that can strand assets and impair borrowers."
+    },
+    {
+      "id": "concentration-limits",
+      "category": "credit_policy",
+      "intent": "BENCHMARK",
+      "query": "What large exposure or concentration limits do CBUAE standards impose on banks?",
+      "expect_terms": ["large exposure", "concentration", "25"],
+      "reference_answer": "Large exposure rules limit a bank's exposure to a single counterparty or group of connected counterparties, generally to 25% of eligible capital, with aggregate limits and tighter caps for related parties. Banks must monitor and report concentrations and hold governance processes for exceptions."
+    },
+    {
+      "id": "ecl-scenarios",
+      "category": "ifrs9",
+      "intent": "BENCHMARK",
+      "query": "Why does IFRS 9 require multiple macroeconomic scenarios in ECL measurement?",
+      "expect_terms": ["scenario", "forward-looking", "probability"],
+      "reference_answer": "IFRS 9 requires ECL to be an unbiased, probability-weighted estimate reflecting a range of possible outcomes. Because the relationship between macroeconomic conditions and credit losses is non-linear, using a single central scenario would understate expected losses; banks therefore weight base, upside, and downside scenarios with forward-looking information."
+    },
+    {
+      "id": "keyword-light-sicr",
+      "category": "paraphrase_robustness",
+      "intent": "BENCHMARK",
+      "query": "At what point does a loan stop being measured with a 12-month loss allowance?",
+      "expect_terms": ["stage 2", "significant increase", "lifetime"],
+      "reference_answer": "When a significant increase in credit risk since initial recognition occurs, the asset transfers from Stage 1 to Stage 2 and the allowance moves from 12-month expected credit losses to lifetime expected credit losses."
+    },
+    {
+      "id": "keyword-light-buffer",
+      "category": "paraphrase_robustness",
+      "intent": "BENCHMARK",
+      "query": "How much extra capital cushion must banks build on top of the hard minimums to avoid distribution restrictions?",
+      "expect_terms": ["conservation buffer", "2.5"],
+      "reference_answer": "The capital conservation buffer of 2.5% of risk-weighted assets, made up of CET1 capital, sits above the minimum requirements. Banks whose capital falls into the buffer range face progressive restrictions on dividend distributions and discretionary bonus payments."
+    }
+  ]
+}

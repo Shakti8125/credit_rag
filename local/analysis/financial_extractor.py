@@ -81,6 +81,17 @@ class FinancialProfile:
     pd_estimate:        Optional[float] = None   # PD %
     lgd_estimate:       Optional[float] = None   # LGD %
 
+    # Model performance (CBUAE Model Management Guidelines)
+    gini:           Optional[float] = None   # discrimination, % (0-100)
+    auc:            Optional[float] = None   # discrimination, 0-1 scale
+    ks_stat:        Optional[float] = None   # Kolmogorov-Smirnov, % (0-100)
+    psi:            Optional[float] = None   # Population Stability Index, decimal
+
+    # IFRS 9 ECL / staging
+    ecl_coverage:   Optional[float] = None   # Stage 3 provision coverage %
+    stage2_ratio:   Optional[float] = None   # Stage 2 exposures as % of book
+    stage3_ratio:   Optional[float] = None   # Stage 3 exposures as % of book
+
     # Extraction metadata
     doc_type:           str = "Unknown"
     extraction_warnings: List[str] = field(default_factory=list)
@@ -184,7 +195,7 @@ def _extract_currency(text: str, label_patterns: List[str]) -> Optional[MetricVa
 def _extract_percentage(text: str, label_patterns: List[str]) -> Optional[MetricValue]:
     for label in label_patterns:
         p = re.compile(
-            rf'\b{label}\b[\s:=–-]*(?:of\s+)?(\d+(?:\.\d+)?)\s?%',
+            rf'\b{label}\b[\s:=–-]*(?:(?:of|at)\s+)?(\d+(?:\.\d+)?)\s?%',
             re.IGNORECASE
         )
         m = p.search(text)
@@ -290,7 +301,7 @@ class FinancialExtractor:
                 text, ["Collateral Value", "Security Value", "Mortgage Value",
                         "Collateral", "Primary Security"]
             )
-            profile.tenor = _extract_tenor(text)
+            profile.facility_tenor = _extract_tenor(text)
             profile.interest_rate = _extract_percentage(
                 text, ["Interest Rate", "Lending Rate", "Spread", "Margin",
                         "Rate of Interest", "ROI"]
@@ -344,6 +355,45 @@ class FinancialExtractor:
         profile.pd_estimate = pd.value if pd else None
         lgd = _extract_percentage(text, ["LGD", "Loss Given Default", "LGD Estimate"])
         profile.lgd_estimate = lgd.value if lgd else None
+
+        # ── Model performance metrics (CBUAE MMG) ────────────────────
+        # Gini/KS may appear as "45%" or as a fraction "0.45" — normalise
+        # fractions to % scale. AUC stays on its native 0-1 scale.
+        gini = (_extract_percentage(text, ["Gini", "Gini Coefficient", "Gini Index"])
+                or _extract_ratio(text, ["Gini", "Gini Coefficient", "Gini Index"]))
+        if gini:
+            profile.gini = gini.value * 100 if gini.value <= 1 else gini.value
+
+        auc = (_extract_percentage(text, ["AUC", "AUROC", "ROC[- ]AUC", "Area Under (?:the )?Curve"])
+               or _extract_ratio(text, ["AUC", "AUROC", "ROC[- ]AUC"]))
+        if auc:
+            profile.auc = auc.value / 100 if auc.value > 1 else auc.value
+
+        ks = (_extract_percentage(text, ["KS Statistic", "KS Stat", "Kolmogorov[- ]Smirnov", "KS"])
+              or _extract_ratio(text, ["KS Statistic", "KS Stat", "Kolmogorov[- ]Smirnov"]))
+        if ks:
+            profile.ks_stat = ks.value * 100 if ks.value <= 1 else ks.value
+
+        psi = _extract_ratio(text, ["PSI", "Population Stability Index"])
+        if psi:
+            profile.psi = psi.value / 100 if psi.value > 1 else psi.value
+
+        # ── IFRS 9 ECL / staging ──────────────────────────────────────
+        ecl_cov = _extract_percentage(
+            text, ["ECL Coverage", "Provision Coverage(?: Ratio)?",
+                   "Stage 3 Coverage", "Coverage Ratio", "NPL Coverage"]
+        )
+        profile.ecl_coverage = ecl_cov.value if ecl_cov else None
+
+        s2 = _extract_percentage(
+            text, ["Stage 2(?: Ratio| Exposures?| Loans?)?", "Stage[- ]2"]
+        )
+        profile.stage2_ratio = s2.value if s2 else None
+
+        s3 = _extract_percentage(
+            text, ["Stage 3(?: Ratio| Exposures?| Loans?)?", "Stage[- ]3"]
+        )
+        profile.stage3_ratio = s3.value if s3 else None
 
         # ── Warnings for missing critical metrics ─────────────────────
         if "Credit Proposal" in doc_type:

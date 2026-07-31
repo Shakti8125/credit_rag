@@ -1,3 +1,21 @@
+# Local tier (Streamlit frontend + on-device pipeline)
+streamlit
+requests
+python-dotenv
 
+# Privacy pipeline
+spacy
+docling
+
+# RAG
 sentence-transformers
+faiss-cpu
 pinecone
+langchain-text-splitters
+numpy
+
+# Local SLM inference
+llama-cpp-python
+
+# Audit trail PDF export (optional — falls back to plain text without it)
+reportlab

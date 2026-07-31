@@ -41,6 +41,19 @@ class DocumentValidator:
             "malformed_placeholder": re.compile(r"\{\{.*?\}\}|\{\%.*?\%\}")
         }
 
+        # Bank-name leakage check — same dictionary the masker uses, same
+        # alphabetic lookaround anchors (catches names inside filenames and
+        # underscore/slash-joined tokens where \b fails). Any surviving bank
+        # name in supposedly-masked text means the masker missed it → block.
+        from local.privacy.bank_dictionary import BANK_DICTIONARY
+        bank_alternation = "|".join(
+            re.escape(b) for b in sorted(BANK_DICTIONARY, key=len, reverse=True)
+        )
+        self.leakage_patterns["bank_name"] = re.compile(
+            rf"(?<![a-zA-Z])(?:{bank_alternation})(?![a-zA-Z])",
+            re.IGNORECASE,
+        )
+
     def validate(self, masked_text: str) -> Dict[str, Any]:
         """
         Scans a text string against all configured leakage risk signatures.

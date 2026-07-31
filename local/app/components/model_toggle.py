@@ -1,39 +1,48 @@
 import streamlit as st
 
-def render_model_toggle():
+# Canonical engine identifiers used across the app (intent.py, main.py,
+# handlers). The UI shows friendly labels; comparisons use these constants
+# so model choices can change without touching routing logic.
+ENGINE_CLOUD = "cloud"
+ENGINE_LOCAL = "local"
+
+_LABELS = {
+    ENGINE_CLOUD: "☁️ Cloud",
+    ENGINE_LOCAL: "💻 Local",
+}
+
+
+def render_model_toggle() -> str:
     """
-    Renders the A/B testing toggle between the local SLM and cloud LLM.
-    Acts as the centerpiece for demonstrating terminology precision and 
-    architectural constraints during the technical interview.
+    Renders the Cloud/Local execution-tier toggle.
+    Returns ENGINE_CLOUD or ENGINE_LOCAL.
     """
     st.markdown("### 🧠 Inference Engine Selection")
-    
-    # Initialize default state
-    if "active_model" not in st.session_state:
-        st.session_state["active_model"] = "Gemini Pro (Cloud)"
 
-    # Render horizontal toggle for clean UI
-    selected_model = st.radio(
+    if "active_engine" not in st.session_state:
+        st.session_state["active_engine"] = ENGINE_CLOUD
+
+    selected_label = st.radio(
         "Route Generation Through:",
-        options=["Gemini Pro (Cloud)", "Phi-3 (Local Edge)"],
-        index=0 if st.session_state["active_model"] == "Gemini Pro (Cloud)" else 1,
+        options=[_LABELS[ENGINE_CLOUD], _LABELS[ENGINE_LOCAL]],
+        index=0 if st.session_state["active_engine"] == ENGINE_CLOUD else 1,
         horizontal=True,
-        help="Compare terminology precision between the localized SLM and the heavy cloud LLM."
+        help="Cloud: full multi-source reasoning via the backend API. "
+             "Local: fully on-device inference — nothing leaves this machine.",
     )
-    
-    st.session_state["active_model"] = selected_model
+    selected_engine = ENGINE_CLOUD if selected_label == _LABELS[ENGINE_CLOUD] else ENGINE_LOCAL
 
-    # Enforce the strict constraints outlined in the project plan
-    if selected_model == "Phi-3 (Local Edge)":
+    st.session_state["active_engine"] = selected_engine
+
+    if selected_engine == ENGINE_LOCAL:
         st.warning(
-            "⚠️ **Local Engine Active:** Phi-3 is restricted to `GENERAL` intent queries "
-            "(definitional or contextual) only. It lacks the parameter count to reliably synthesize "
-            "`BENCHMARK` or `HYBRID` context chunks."
+            "⚠️ **Local tier active:** best for definitional and single-document "
+            "queries. `COMPARE` and `EWS` modes require the Cloud tier."
         )
     else:
         st.caption(
-            "☁️ **Cloud Engine Active:** Gemini 1.5 Pro is enabled. Fully capable of "
-            "handling `EXTRACT`, `BENCHMARK`, and `HYBRID` multi-source reasoning paths."
+            "☁️ **Cloud tier active:** full `EXTRACT`, `BENCHMARK`, and `HYBRID` "
+            "multi-source reasoning."
         )
-        
-    return selected_model
+
+    return selected_engine

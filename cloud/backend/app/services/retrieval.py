@@ -7,12 +7,15 @@ retrieve_context() fetches a larger pool (rerank_pool) from Pinecone, then
 reranks with cross-encoder/ms-marco-MiniLM-L-6-v2 before returning top_k.
 """
 
-import os
 import logging
 from typing import List, Optional
 
 from pinecone import Pinecone
 from pydantic import BaseModel
+
+from app.services.secrets import get_secret
+from shared.env import get_env
+from shared.hybrid import BM25Okapi, rrf_fuse
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +31,16 @@ class Citation(BaseModel):
 class PineconeRetrievalService:
 
     def __init__(self):
-        api_key    = os.getenv("PINECONE_API_KEY")
-        index_name = os.getenv("PINECONE_INDEX_NAME", "creditrag")
+        # get_secret resolves from the environment first and falls back to SSM
+        # Parameter Store, so under Lambda the key never has to sit in a
+        # plaintext function environment variable. Local dev is unchanged.
+        try:
+            api_key = get_secret("PINECONE_API_KEY")
+        except Exception as e:
+            api_key = None
+            logger.error("PINECONE_API_KEY could not be resolved from env or SSM: %s", e)
 
-        if not api_key:
-            logger.error("PINECONE_API_KEY environment variable is missing!")
+        index_name = get_env("PINECONE_INDEX_NAME", "creditrag")
 
         self.pc              = Pinecone(api_key=api_key)
         self.index           = self.pc.Index(index_name)
@@ -120,6 +128,22 @@ class PineconeRetrievalService:
                 rerank_score = None,
             ))
 
+        # ── Hybrid fusion: dense order (Pinecone) + BM25 over the pool ──
+        # RRF is rank-based so the two score scales never need calibration.
+        # The fused list is also truncated before the cross-encoder, halving
+        # the CPU reranking cost versus scoring the full recall pool.
+        ce_pool = min(len(candidates), max(top_k * 2, 10))
+        try:
+            bm25       = BM25Okapi([c.text for c in candidates])
+            dense_rank = list(range(len(candidates)))         # Pinecone already sorted
+            bm25_rank  = [i for i, _ in bm25.top_n(query, len(candidates))]
+            fused      = rrf_fuse([dense_rank, bm25_rank])[:ce_pool]
+            candidates = [candidates[i] for i, _ in fused]
+            logger.info("Hybrid fusion: pool %d → %d for cross-encoder.", len(matches), len(candidates))
+        except Exception as e:
+            logger.warning("BM25 fusion failed (%s) — dense order only.", e)
+            candidates = candidates[:ce_pool]
+
         # ── Cross-encoder rerank ───────────────────────────────────────
         if self._cross_encoder is not None and len(candidates) > 1:
             pairs = [(query, c.text) for c in candidates]
@@ -133,6 +157,6 @@ class PineconeRetrievalService:
                     len(candidates), top_k, candidates[0].rerank_score,
                 )
             except Exception as e:
-                logger.warning("Cross-encoder reranking failed (%s) — using bi-encoder order.", e)
+                logger.warning("Cross-encoder reranking failed (%s) — using hybrid order.", e)
 
         return candidates[:top_k]

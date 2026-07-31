@@ -1,9 +1,22 @@
+"""
+Shared masking infrastructure used by both tiers.
+
+EntityRegistry is framework-agnostic bookkeeping (no spaCy/heavy deps), so it
+lives here and is imported by local/privacy (which does the actual heavy
+NER-based masking) as well as by the cloud routes (which only need to unmask
+placeholders using the dict handed back by the local tier).
+
+unmask_text() is the single dict-based placeholder-replacement routine —
+previously duplicated across cloud/backend/app/routes/{query,compare,ews}.py.
+"""
+
 import threading
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
+
 
 class EntityRegistry:
     """
-    Thread-safe registry that maps real-world sensitive entities to deterministic 
+    Thread-safe registry that maps real-world sensitive entities to deterministic
     placeholders and maintains an audit log for downstream UI visibility.
     """
     def __init__(self) -> None:
@@ -33,12 +46,12 @@ class EntityRegistry:
             # Generate new sequential index token
             current_counter = self._counters.get(entity_label, 1)
             placeholder = f"[{entity_label}_{current_counter}]"
-            
+
             # Update tracking states
             self._counters[entity_label] = current_counter + 1
             self._forward_registry[cleaned_text] = placeholder
             self._reverse_registry[placeholder] = cleaned_text
-            
+
             return placeholder
 
     def unmask_text(self, masked_text: str) -> str:
@@ -46,24 +59,16 @@ class EntityRegistry:
         Reverses the masking process by replacing tokens with their original text strings.
         Used when translating responses returning from cloud inference.
         """
-        unmasked = masked_text
         with self._lock:
-            # Sorting by length descending eliminates partial substitution bugs 
-            # (e.g., matching [ORG_1] before [ORG_11])
-            sorted_tokens = sorted(self._reverse_registry.items(), key=lambda x: len(x[0]), reverse=True)
-            for placeholder, real_value in sorted_tokens:
-                unmasked = unmasked.replace(placeholder, real_value)
-        return unmasked
-    
-    def get_audit_log(self):
+            return unmask_text(masked_text, self._reverse_registry)
+
+    def get_audit_log(self) -> List[Dict[str, Any]]:
         """
         Backward compatible audit log.
         Used by privacy pipeline.
         Does not include financial values.
         """
-
         with self._lock:
-
             return [
                 {
                     "placeholder": placeholder,
@@ -74,12 +79,8 @@ class EntityRegistry:
             ]
 
     def get_mask_dictionary(self) -> Dict[str, str]:
-
         with self._lock:
-
-            return dict(
-                self._reverse_registry
-            )
+            return dict(self._reverse_registry)
 
     def clear(self) -> None:
         """Resets the state registry for a new document session execution loop."""
@@ -87,3 +88,18 @@ class EntityRegistry:
             self._forward_registry.clear()
             self._reverse_registry.clear()
             self._counters.clear()
+
+
+def unmask_text(text: str, masked_items: Optional[Dict[str, str]]) -> str:
+    """
+    Replaces placeholder tokens (e.g. "[ORG_1]") with their original values.
+
+    Sorted by placeholder length descending so "[ORG_11]" is replaced before
+    "[ORG_1]" — otherwise the shorter token would partially match inside the
+    longer one and corrupt the substitution.
+    """
+    if not masked_items or not text:
+        return text
+    for placeholder in sorted(masked_items.keys(), key=len, reverse=True):
+        text = text.replace(placeholder, masked_items[placeholder])
+    return text

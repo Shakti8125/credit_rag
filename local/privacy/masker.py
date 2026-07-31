@@ -4,212 +4,489 @@ from typing import List, Tuple, Set
 import spacy
 from spacy.tokens import Doc
 
-from local.privacy.entity_registry import EntityRegistry
+from shared.masking import EntityRegistry
+from local.privacy.bank_dictionary import BANK_DICTIONARY
+
 
 logger = logging.getLogger(__name__)
 
+
 class DocumentMasker:
     """
-    Protects data privacy by identifying and masking PII using spaCy NER, 
-    while preserving structural financial metrics via explicit freezing rules.
+    Privacy masking layer for financial documents.
+
+    Masks:
+        - Named banks (dictionary-based)
+        - Emails, phones, SSNs, EINs (regex)
+        - Real person names, genuine org names, GPE/LOC entities (spaCy NER)
+
+    Preserves:
+        - Financial numbers, ratios, percentages, years
+        - Credit risk domain terms (PD, LGD, DSCR, NPA, GINI, WoE, etc.)
+        - Column names, abbreviations, model variable names
+        - Currency codes (AED, USD, INR…)
+        - Short tokens (≤2 chars) — too ambiguous to mask safely
+        - Legal entity suffixes used as common nouns ("Public Joint Stock Company")
+
+    Designed for Credit-RAG pipeline.
     """
-    def __init__(self, registry: EntityRegistry, spacy_model: str = "en_core_web_trf") -> None:
+
+    def __init__(
+        self,
+        registry: EntityRegistry,
+        spacy_model: str = "en_core_web_trf"
+    ) -> None:
+
         self.registry = registry
-        
-        logger.info(f"Loading spaCy NER model: {spacy_model}...")
+
+        logger.info("Loading spaCy model: %s", spacy_model)
+
         try:
-            # Primary choice: Transformer pipeline for high recall
             self.nlp = spacy.load(spacy_model)
         except OSError:
-            logger.warning(f"Target model '{spacy_model}' unavailable. Falling back to 'en_core_web_sm'.")
+            logger.warning("Transformer unavailable, falling back to en_core_web_sm")
             self.nlp = spacy.load("en_core_web_sm")
-            
-        # Compiled financial metric match rules to guarantee preservation of risk parameters
+
+        # ======================================================
+        # Financial expressions — NEVER MASK
+        # ======================================================
+
         self.financial_patterns = [
-            # Currency expressions with scale variants: $14.5M, £250k, USD 5,000,000, 45 Billion
-            re.compile(r'\b(?:AED|USD|EUR|GBP)?\s?[\$\u20AC\u00A3]?\s?\d+(?:\.\d+)?\s?(?:M|B|k|Million|Billion)?\b', re.IGNORECASE),
-            # Risk ratio formulas: DSCR 1.25x, LTV 70%, Debt/EBITDA of 3.5x
-            re.compile(r'\b(?:DSCR|LTV|Leverage|TOL/ATNW|Debt/EBITDA|ROE|ROA)\b\s*(?:of|is)?\s*\d+(?:\.\d+)?\s?%?x?\b', re.IGNORECASE),
-            # Isolated standard metrics and sizing multipliers: 10.25%, 2.0x
-            re.compile(r'\b\d+(?:\.\d+)?\s?%\b'),
-            re.compile(r'\b\d+(?:\.\d+)?\s?x\b', re.IGNORECASE)
-        ]
-        
-        # Target labels to match against high-risk categories
-        self.target_ner_labels: Set[str] = {"PERSON", "ORG", "GPE", "DATE", "FAC", "LOC"}
 
-        # Regex patterns for structured PII that spaCy NER misses.
-        # Each entry: (label, compiled_pattern)
-        # These are applied as a pre-pass in mask() BEFORE spaCy runs, so the
-        # validator's egress check never sees raw PII in the output.
+            # Currency values
+            re.compile(
+                r"""
+                \b
+                (?:AED|USD|EUR|GBP|INR|SAR|QAR|KWD|BHD|OMR)?
+                \s?
+                [$€£₹]?
+                \s?
+                \d{1,3}
+                (?:,\d{3})*
+                (?:\.\d+)?
+                \s?
+                (?:k|m|b|million|billion|cr|lakh)?
+                \b
+                """,
+                re.I | re.X
+            ),
+
+            # Credit ratios with value
+            re.compile(
+                r"""
+                \b
+                (?:DSCR|LTV|ROE|ROA|
+                TOL/ATNW|
+                Debt/EBITDA|
+                Leverage|ICR|CAR|CRAR|
+                NPA|GNPA|NNPA|
+                CET1|Tier\s*1)
+                \s*
+                (?:of|is|:|=)?
+                \s*
+                \d+(?:\.\d+)?
+                \s*
+                (?:%|x)?
+                \b
+                """,
+                re.I | re.X
+            ),
+
+            # Bare percentage
+            re.compile(r"\b\d+(?:\.\d+)?%\b"),
+
+            # Multiples
+            re.compile(r"\b\d+(?:\.\d+)?x\b", re.I),
+
+            # Financial years
+            re.compile(r"\b(?:19|20)\d{2}\b"),
+
+            # FY notation
+            re.compile(r"\bFY\d{2,4}\b", re.I),
+        ]
+
+        # ======================================================
+        # NER labels to consider for masking
+        # ======================================================
+
+        self.target_ner_labels: Set[str] = {
+            "PERSON",
+            "ORG",
+            "GPE",
+            "LOC",
+            "FAC",
+        }
+
+        # ======================================================
+        # ORG confidence filter — only mask orgs that contain
+        # at least one of these keywords (signals a real entity)
+        # ======================================================
+
+        self.high_confidence_org_keywords = {
+            "bank",
+            "limited",
+            "ltd",
+            "llc",
+            "plc",
+            "corp",
+            "corporation",
+            "inc",
+            "company",
+            "consulting",
+            "solutions",
+            "private limited",
+            "group",
+            "holding",
+            "holdings",
+            "finance",
+            "capital",
+            "investment",
+            "securities",
+            "insurance",
+        }
+
+        # ======================================================
+        # DOMAIN BLOCKLIST — tokens spaCy frequently
+        # misclassifies as PERSON / GPE / LOC / ORG.
+        #
+        # Covers:
+        #   - Credit risk metrics & model terms
+        #   - Statistical / ML variable names
+        #   - Column headers from banking data files
+        #   - Currency / country codes
+        #   - Common legal suffixes used as nouns
+        # ======================================================
+
+        self.domain_blocklist: Set[str] = {
+
+            # ── Credit risk metrics ───────────────────────────────
+            "pd", "lgd", "ead", "el", "ul", "rwa",
+            "dscr", "icr", "ltv", "ltc", "npa", "gnpa", "nnpa",
+            "car", "crar", "cet1", "tier1",
+            "roe", "roa", "roce", "ebitda", "ebit", "pat", "pbt",
+            "tol", "atnw", "tnw", "opex", "capex",
+
+            # ── Statistical / ML / scorecard terms ───────────────
+            "gini", "ks", "auc", "roc", "iv", "woe",
+            "chi", "chi-square", "wald", "wald chi-square",
+            "p-value", "pvalue", "r-squared", "rsquared",
+            "logit", "probit", "regression", "coefficient",
+            "odds", "log-odds", "beta", "alpha",
+            "precision", "recall", "f1", "accuracy",
+            "train", "test", "validation",
+            "oversampling", "undersampling", "smote",
+            "bootstrap", "bagging", "binning",
+            "fine binning", "coarse binning",
+            "information value", "weight of evidence",
+            "scorecard", "score", "cutoff",
+            "decile", "quartile", "percentile", "quintile",
+            "snapshot", "vintage",
+
+            # ── Column / variable names common in banking data ────
+            "cif_no", "crnno", "finware_acno",
+            "maritalstatus", "allocatedamt",
+            "mismonth", "mis_month",
+            "gt85p_le100p", "gt100p",
+            "fourth snapshot", "first snapshot",
+            "max", "min", "mean", "median", "mode", "std",
+            "null", "nan", "n/a", "na",
+            "stat", "status",
+
+            # ── Currency & country codes ──────────────────────────
+            "aed", "usd", "eur", "gbp", "inr", "sar",
+            "qar", "kwd", "bhd", "omr",
+            "uae", "gcc", "mena",
+
+            # ── Number magnitude abbreviations ────────────────────
+            "mn", "bn", "cr", "lakh", "lac",
+
+            # ── Legal entity suffixes used as common nouns ────────
+            "public joint stock company",
+            "private joint stock company",
+            "joint stock company",
+            "limited liability company",
+            "sole proprietorship",
+            "partnership",
+
+            # ── Generic credit / banking phrases ─────────────────
+            "fir the bank",          # hallucination
+            "the bank",
+            "bank",
+            "borrower",
+            "guarantor",
+            "obligor",
+            "counterparty",
+            "lender",
+        }
+
+        # ======================================================
+        # Regex PII patterns
+        # ======================================================
+
         self.pii_patterns: List[Tuple[str, re.Pattern]] = [
-            # Email addresses
-            ("EMAIL", re.compile(
-                r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
-                re.IGNORECASE
-            )),
-            # International / local phone numbers: +971-4-123-4567, (04) 123 4567, 04-1234567
-            ("PHONE", re.compile(
-                r"\b(?:\+?[\d\s\-\.]{1,4})?(?:\(?\d{2,4}\)?[\s\-\.]?)(?:\d{3,4}[\s\-\.]?){1,3}\d{3,4}\b"
-            )),
-            # US SSN: 123-45-6789
-            ("SSN", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
-            # US EIN / corporate tax ID: 12-3456789
-            ("EIN", re.compile(r"\b\d{2}-\d{7}\b")),
+
+            (
+                "EMAIL",
+                re.compile(
+                    r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+                    re.X
+                )
+            ),
+
+            (
+                "PHONE",
+                re.compile(
+                    r"""
+                    (?:
+                        \+\d{1,3}[\s-]?
+                    )?
+                    (?:
+                        \(?\d{2,4}\)?[\s-]?
+                    )
+                    \d{3,4}[\s-]?\d{3,4}
+                    """,
+                    re.X
+                )
+            ),
+
+            (
+                "SSN",
+                re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+            ),
+
+            (
+                "EIN",
+                re.compile(r"\b\d{2}-\d{7}\b")
+            ),
         ]
 
-        self.bank_patterns = [
-            "Emirates NBD",
-            "First Abu Dhabi Bank",
-            "FAB",
-            "Abu Dhabi Commercial Bank",
-            "ADCB",
-            "Dubai Islamic Bank",
-            "DIB",
-            "Mashreq Bank",
-            "Mashreq",
-            "RAKBANK",
-            "Rak Bank",
-            "Commercial Bank of Dubai",
-            "CBD Bank",
-            "National Bank of Abu Dhabi",
-            "NBAD",
-            "Al Hilal Bank",
-            "HSBC UAE",
-            "Standard Chartered UAE",
-            "Citibank UAE",
+        # ======================================================
+        # Bank dictionary (dictionary-based, highest confidence)
+        # ======================================================
 
-            # GCC / Middle East
-            "Qatar National Bank",
-            "QNB",
-            "Doha Bank",
-            "Kuwait Finance House",
-            "KFH",
-            "National Bank of Kuwait",
-            "NBK",
-            "Al Rajhi Bank",
-            "Saudi National Bank",
-            "SNB",
-            "Arab National Bank",
-            "Bank Muscat",
-            "Oman Arab Bank",
-        ]
+        self.bank_patterns = BANK_DICTIONARY
+
+    # ==========================================================
+    # Guard helpers
+    # ==========================================================
+
+    def _is_in_domain_blocklist(self, text: str) -> bool:
+        """
+        Returns True if the entity text (case-insensitive, stripped)
+        matches any entry in the domain blocklist.
+        Checks both exact match and prefix match for compound terms.
+        """
+        normalised = text.strip().lower()
+
+        # Exact match
+        if normalised in self.domain_blocklist:
+            return True
+
+        # Any blocklist phrase contained within the entity text
+        for term in self.domain_blocklist:
+            if term in normalised:
+                return True
+
+        return False
+
+    def _is_too_short(self, text: str) -> bool:
+        """
+        Tokens with 2 or fewer non-whitespace characters are too
+        ambiguous to mask safely (e.g. 'PD', 'KS', 'IV', 'MN').
+        """
+        return len(text.strip()) <= 2
+
+    def _is_all_caps_abbreviation(self, text: str) -> bool:
+        """
+        ALL-CAPS tokens of 3–6 characters are almost always domain
+        acronyms (NPA, GINI, WoE, DSCR) — never real person names.
+        spaCy frequently misclassifies these as PERSON or GPE.
+        """
+        stripped = text.strip()
+        return (
+            3 <= len(stripped) <= 6
+            and stripped.isupper()
+            and stripped.isalpha()
+        )
+
+    def _is_real_org(self, text: str) -> bool:
+        """
+        Only mask ORG entities that contain a known org-type keyword.
+        Prevents masking generic phrases like 'fir the bank'.
+        """
+        value = text.lower()
+        return any(kw in value for kw in self.high_confidence_org_keywords)
+
+    def _is_financial_number(self, text: str) -> bool:
+        return any(
+            p.fullmatch(text.strip())
+            for p in self.financial_patterns
+        )
+
+    def _get_protected_spans(self, text: str) -> List[Tuple[int, int]]:
+        spans = []
+        for pattern in self.financial_patterns:
+            for match in pattern.finditer(text):
+                spans.append(match.span())
+        return spans
+
+    def _is_overlapping(self, entity_span, protected_spans) -> bool:
+        start, end = entity_span
+        for p_start, p_end in protected_spans:
+            if not (end <= p_start or start >= p_end):
+                return True
+        return False
+
+    def _should_skip_entity(self, ent_text: str, ent_label: str) -> bool:
+        """
+        Single consolidated gate: returns True if the entity should
+        NOT be masked. Called once per spaCy entity.
+        """
+        # 1. Domain blocklist (catches column names, acronyms, etc.)
+        if self._is_in_domain_blocklist(ent_text):
+            logger.debug("Blocklist skip: '%s' (%s)", ent_text, ent_label)
+            return True
+
+        # 2. Pure financial number
+        if self._is_financial_number(ent_text):
+            return True
+
+        # 3. Too short to be a meaningful PII entity
+        if self._is_too_short(ent_text):
+            return True
+
+        # 4. ALL-CAPS abbreviation (≤6 chars) — almost always a domain acronym
+        if self._is_all_caps_abbreviation(ent_text):
+            logger.debug("ALL-CAPS skip: '%s' (%s)", ent_text, ent_label)
+            return True
+
+        # 5. ORG requires additional keyword confirmation
+        if ent_label == "ORG" and not self._is_real_org(ent_text):
+            return True
+
+        # 6. PERSON / GPE / LOC — skip if the text looks like a variable
+        #    name (contains underscores, digits mixed with letters, or is
+        #    snake_case — typical of column headers in banking datasets)
+        if ent_label in ("PERSON", "GPE", "LOC"):
+            stripped = ent_text.strip()
+            if "_" in stripped:          # snake_case column name
+                return True
+            if re.search(r"\d", stripped) and re.search(r"[a-zA-Z]", stripped):
+                # Alphanumeric token — likely a code, not a person/place
+                return True
+
+        return False
+
+    # ==========================================================
+    # Regex masking
+    # ==========================================================
 
     def _apply_regex_masks(self, text: str) -> str:
-        """
-        Pre-pass: replaces structured PII (phones, emails, SSNs, EINs) with
-        registry tokens using compiled regex patterns.  Runs before spaCy so
-        the NER model never sees raw PII and the validator's egress check passes.
-        Matches are applied in reverse offset order to preserve string positions.
-        """
-        modifications: List[Tuple[int, int, str]] = []
-
+        replacements = []
         for label, pattern in self.pii_patterns:
             for match in pattern.finditer(text):
                 value = match.group().strip()
                 if not value:
                     continue
-                placeholder = self.registry.register_entity(value, label)
-                modifications.append((match.start(), match.end(), placeholder))
+                token = self.registry.register_entity(value, label)
+                replacements.append((match.start(), match.end(), token))
 
-        if not modifications:
-            return text
+        replacements.sort(key=lambda x: x[0], reverse=True)
+        buffer = list(text)
+        for start, end, replacement in replacements:
+            buffer[start:end] = list(replacement)
+        return "".join(buffer)
 
-        # Sort descending by start offset so replacements don't shift indices
-        modifications.sort(key=lambda x: x[0], reverse=True)
-        text_buffer = list(text)
-        for start, end, replacement in modifications:
-            text_buffer[start:end] = list(replacement)
-
-        logger.debug("Regex pre-pass masked %d structured PII items.", len(modifications))
-        return "".join(text_buffer)
-
-    def _get_protected_spans(self, text: str) -> List[Tuple[int, int]]:
-        """Scans the text string to register boundaries of critical financial numbers."""
-        protected_spans = []
-        for pattern in self.financial_patterns:
-            for match in pattern.finditer(text):
-                protected_spans.append(match.span())
-        return protected_spans
-
-    def _is_overlapping(self, entity_span: Tuple[int, int], protected_spans: List[Tuple[int, int]]) -> bool:
-        """Determines if a named entity span intersects with a frozen financial metric boundary."""
-        ent_start, ent_end = entity_span
-        for p_start, p_end in protected_spans:
-            # Overlap condition check
-            if not (ent_end <= p_start or ent_start >= p_end):
-                return True
-        return False
-    
     def _mask_banks(self, text: str) -> str:
         """
-        Deterministic bank masking.
-        Runs before Gemini/spaCy.
+        Dictionary-based bank masking.
+
+        Uses lookahead/lookbehind instead of \\b word boundaries so bank names
+        are caught in all surface forms:
+          - Normal prose      : "RAKBANK issued a facility"
+          - Filename embedded : "RAK Bank Credit Card Model Development.docx"
+          - Underscore joined : "RAKBANK_report.pdf"
+          - Slash separated   : "data/RAKBANK/2024"
+
+        \\b fails in these cases because \\b treats underscore, dot, and slash
+        as non-word characters, so the boundary is absent between the bank
+        name and those characters.
+
+        The lookahead/lookbehind `(?<![a-zA-Z])` / `(?![a-zA-Z])` anchors on
+        alphabetic characters only, matching across punctuation and filename
+        delimiters while still preventing substring matches inside longer words
+        (e.g. "FAB" must not match inside "FABRIC").
         """
-
         for bank in sorted(self.bank_patterns, key=len, reverse=True):
-
             pattern = re.compile(
-                rf"\b{re.escape(bank)}\b",
-                re.IGNORECASE
+                rf"(?<![a-zA-Z]){re.escape(bank)}(?![a-zA-Z])",
+                re.I,
             )
-
             for match in pattern.finditer(text):
-                token = self.registry.register_entity(
-                    match.group(),
-                    "BANK"
-                )
-
-                text = text.replace(
-                    match.group(),
-                    token
-                )
-
+                token = self.registry.register_entity(match.group(), "BANK")
+                text  = text.replace(match.group(), token)
         return text
 
-    def mask(self, text: str) -> str:
+    def mask_filename(self, filename: str) -> str:
         """
-        Transforms sensitive raw Markdown text into an anonymized payload
-        safe for remote API context parsing.
+        Masks bank names embedded in a filename string.
 
-        Masking order:
-          1. Regex pre-pass  — structured PII (phones, emails, SSNs, EINs)
-          2. Financial freeze — record spans that must NOT be touched
-          3. spaCy NER       — named entities (ORG, PERSON, GPE, DATE, FAC, LOC)
+        Filenames are not prose — they have no sentence structure — so we
+        apply only the bank dictionary pass.  Regex PII and NER are not
+        needed (filenames don't contain emails, phones, or complex entities).
+
+        Returns the masked filename.  If no bank name is found, the original
+        filename is returned unchanged.
+
+        Example:
+            "RAK Bank Credit Card Model Development.docx"
+            → "[BANK_1] Credit Card Model Development.docx"
         """
+        return self._mask_banks(filename)
+
+    # ==========================================================
+    # Main entry point
+    # ==========================================================
+
+    def mask(self, text: str) -> str:
+
         if not text.strip():
             return text
 
-        # Step 1: Regex pre-pass for structured PII spaCy would miss
+        # Step 1: Dictionary bank masking
         text = self._mask_banks(text)
+
+        # Step 2: Regex PII
         text = self._apply_regex_masks(text)
 
-
-        # Step 2: Record regions containing vital financial information
+        # Step 3: Compute financial protection spans
+        # (must run AFTER bank/regex replacements — offsets are now stable)
         protected_spans = self._get_protected_spans(text)
 
-        # Step 3: Run spaCy named entity recognition
+        # Step 4: NER-based masking
         doc: Doc = self.nlp(text)
-        
-        valid_modifications: List[Tuple[int, int, str]] = []
-        
-        for ent in doc.ents:
-            if ent.label_ in self.target_ner_labels:
-                ent_span = (ent.start_char, ent.end_char)
-                
-                # Verify entity doesn't conflict with financial metrics
-                if not self._is_overlapping(ent_span, protected_spans):
-                    placeholder = self.registry.register_entity(ent.text, ent.label_)
-                    valid_modifications.append((ent.start_char, ent.end_char, placeholder))
-                else:
-                    logger.debug(f"Preserved frozen metric overlap window for text: '{ent.text}'")
+        replacements = []
 
-        # Step 4: Apply token changes in reverse string index order
-        # This keeps character array positions steady during text transformations
-        sorted_modifications = sorted(valid_modifications, key=lambda x: x[0], reverse=True)
-        
-        text_buffer = list(text)
-        for start, end, replacement in sorted_modifications:
-            text_buffer[start:end] = list(replacement)
-            
-        return "".join(text_buffer)
+        for ent in doc.ents:
+
+            if ent.label_ not in self.target_ner_labels:
+                continue
+
+            if self._is_overlapping(
+                (ent.start_char, ent.end_char),
+                protected_spans,
+            ):
+                continue
+
+            if self._should_skip_entity(ent.text, ent.label_):
+                continue
+
+            token = self.registry.register_entity(ent.text, ent.label_)
+            replacements.append((ent.start_char, ent.end_char, token))
+
+        replacements.sort(key=lambda x: x[0], reverse=True)
+        buffer = list(text)
+        for start, end, replacement in replacements:
+            buffer[start:end] = list(replacement)
+
+        return "".join(buffer)

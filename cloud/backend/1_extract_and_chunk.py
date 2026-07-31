@@ -1,25 +1,23 @@
 import os
+import sys
 import glob
 import json
-import logging
+from pathlib import Path
 from docling.document_converter import DocumentConverter
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from shared.chunking import chunk_by_words
+from shared.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 RAW_DIR = "./base_documents"
 STAGING_FILE = "./chunks_staging.json"
 CHUNK_SIZE_WORDS = 200
 CHUNK_OVERLAP_WORDS = 40
-
-def chunk_text(text: str, max_words: int, overlap: int):
-    words = text.split()
-    chunks = []
-    for i in range(0, len(words), max_words - overlap):
-        chunks.append(" ".join(words[i:i + max_words]))
-        if i + max_words >= len(words):
-            break
-    return chunks
 
 def extract_to_json():
     converter = DocumentConverter()
@@ -32,7 +30,7 @@ def extract_to_json():
         try:
             result = converter.convert(file_path)
             raw_text = result.document.export_to_markdown()
-            chunks = chunk_text(raw_text, CHUNK_SIZE_WORDS, CHUNK_OVERLAP_WORDS)
+            chunks = chunk_by_words(raw_text, CHUNK_SIZE_WORDS, CHUNK_OVERLAP_WORDS)
             
             for i, chunk_text_data in enumerate(chunks):
                 all_chunks.append({

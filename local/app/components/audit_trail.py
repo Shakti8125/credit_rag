@@ -78,7 +78,13 @@ def render_audit_trail(audit_trail: List[Dict[str, Any]], doc_filename=None):
             if breach and breach not in ("—", ""):
                 st.caption(f"⚡ {breach}")
 
-            with st.expander("View answer", expanded=False):
+            # st.expander cannot nest inside the outer "Audit Trail" expander
+            # (Streamlit forbids nested expanders), so a checkbox toggle is
+            # used here instead. Key from timestamp+query, not list position:
+            # positional keys shift when a new entry is prepended, silently
+            # re-applying one entry's checkbox state to a different entry.
+            entry_key = f"audit_view_{hash((ts, q)) & 0xFFFFFFFF:08x}"
+            if st.checkbox("View answer", key=entry_key):
                 st.markdown(answer[:800] + ("…" if len(answer) > 800 else ""))
                 st.caption(f"⏱ {elapsed:.2f}s")
 

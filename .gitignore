@@ -19,6 +19,9 @@ faiss_index/
 # Logs
 logs/
 
+# Eval run artifacts (baseline.json, thresholds.json, golden_set.json ARE tracked)
+eval/reports/
+
 # Data
 data/
 *.pdf

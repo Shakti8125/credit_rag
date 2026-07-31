@@ -1,0 +1,30 @@
+{
+  "privacy": {
+    "bank_leak_rate": 0.0,
+    "pii_leak_rate": 0.0,
+    "financial_preservation": 1.0,
+    "firewall_catch_rate": 1.0,
+    "roundtrip_failures": 0,
+    "fixtures": 3
+  },
+  "adversarial": {
+    "must_block_leak_rate": 0.0,
+    "hardening_catch_rate": 0.14285714285714285,
+    "must_block_checks": 13,
+    "hardening_checks": 7
+  },
+  "retrieval": {
+    "bm25_hit@1": 1.0,
+    "bm25_hit@3": 1.0,
+    "bm25_mrr": 1.0,
+    "bm25_ndcg@5": 1.0,
+    "dense_hit@1": 0.9375,
+    "dense_hit@3": 1.0,
+    "dense_mrr": 0.96875,
+    "dense_ndcg@5": 0.9769331095982161,
+    "hybrid_hit@1": 1.0,
+    "hybrid_hit@3": 1.0,
+    "hybrid_mrr": 1.0,
+    "hybrid_ndcg@5": 1.0
+  }
+}

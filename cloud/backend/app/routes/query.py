@@ -15,33 +15,21 @@ Flow per request:
 """
 
 import logging
+import time
 from typing import Optional, List, Dict, Any
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
-from app.services.generation import GenerationService
-from app.services.retrieval  import PineconeRetrievalService, Citation
+from app.services.retrieval  import Citation
+from app.services.engines    import llm_engine, retrieval_engine, record_telemetry
 from app.services.prompt_builder import PromptBuilder
 from app.services.doc_injector   import DocumentInjector
+from shared.chunking import chunk_by_words
+from shared.hybrid import BM25Okapi
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-# ---------------------------------------------------------------------------
-# Service singletons (initialised once at import time)
-# ---------------------------------------------------------------------------
-try:
-    llm_engine = GenerationService()
-except Exception as e:
-    logger.warning("GenerationService unavailable: %s", e)
-    llm_engine = None
-
-try:
-    retrieval_engine = PineconeRetrievalService()
-except Exception as e:
-    logger.warning("PineconeRetrievalService unavailable: %s", e)
-    retrieval_engine = None
 
 doc_injector = DocumentInjector()   # token-length gatekeeper for doc payloads
 
@@ -54,11 +42,19 @@ _CLOUD_RERANK_POOL = 20  # bi-encoder recall pool before cross-encoder
 # Inline schemas
 # ---------------------------------------------------------------------------
 class QueryRequest(BaseModel):
+    # PRIVACY CONTRACT: everything in this payload is already masked by the
+    # local tier. There is deliberately NO masked_items field — the
+    # placeholder→original dictionary must never leave the analyst's machine;
+    # responses are returned masked and the frontend unmasks locally.
     query:        str
     intent:       str
     doc_text:     Optional[str]            = None
-    masked_items: Optional[Dict[str, str]] = None   # {placeholder: original_entity}
     doc_type:     Optional[str]            = "Document" # Added dynamically assigned doc_type
+    # True when doc_text holds chunks already retrieved+reranked client-side.
+    # Explicit flag — the old substring sniffing ("Document Chunks"/"System:")
+    # silently failed for normal frontend payloads, so the server re-chunked
+    # and re-indexed pre-retrieved text on every request.
+    doc_is_prechunked: bool = False
 
 
 class QueryResponse(BaseModel):
@@ -71,66 +67,33 @@ class QueryResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _unmask_text(text: str, masked_items: Optional[Dict[str, str]]) -> str:
-    """
-    Replaces placeholder tokens in text structures with original entity names.
-    Replacements applied longest-key-first to prevent partial substitution
-    (e.g. [ORG_10] matched before [ORG_1]).
-    """
-    if not masked_items or not text:
-        return text
-    result = text
-    for placeholder in sorted(masked_items.keys(), key=len, reverse=True):
-        result = result.replace(placeholder, masked_items[placeholder])
-    return result
-
-
-def _build_faiss_index_from_doc(doc_text: str):
-    """
-    Builds an ephemeral in-memory FAISS index from the masked doc_text.
-    """
-    try:
-        from sentence_transformers import SentenceTransformer
-        from local.rag.chunker     import MarkdownChunker
-        from local.rag.local_index import LocalDocumentIndex
-
-        chunker = MarkdownChunker()
-        chunks  = chunker.chunk(doc_text)
-
-        if not chunks:
-            logger.warning("Cloud doc chunker produced 0 chunks.")
-            return None
-
-        embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-        index       = LocalDocumentIndex(embed_model)
-        index.build(chunks)
-        logger.info("Cloud ephemeral FAISS: %d chunks indexed.", index.chunk_count)
-        return index
-
-    except ImportError as e:
-        logger.warning("FAISS/sentence-transformers unavailable on cloud env: %s", e)
-        return None
-    except Exception as e:
-        logger.error("Cloud FAISS build failed: %s", e, exc_info=True)
-        return None
 
 
 def _retrieve_doc_chunks_cloud(query: str, doc_text: str) -> List[Citation]:
     """
-    Retrieves relevant chunks from the uploaded document using FAISS +
-    cross-encoder reranking. Protects against re-chunking if chunks are 
-    already optimized by the client-side engine.
+    Selects relevant chunks from raw uploaded-document text using BM25
+    (shared.hybrid) + optional cross-encoder reranking.
+
+    This path only fires when the frontend sends RAW doc text instead of
+    pre-retrieved chunks (the normal flow — the Streamlit tier runs hybrid
+    FAISS retrieval client-side and sends preformatted context). BM25 keeps
+    this fallback deployment-safe: no embedding model download/load per
+    request, no local/* imports, works cold in a Lambda container.
     """
-    # Safeguard: If the frontend already passed pre-compiled, formatted context blocks, bypass indexing
+    # Safeguard: if the frontend already passed pre-compiled, formatted
+    # context blocks, bypass server-side selection entirely.
     if "Document Chunks" in doc_text or "System:" in doc_text:
         return []
 
-    faiss_index = _build_faiss_index_from_doc(doc_text)
-    if faiss_index is None or not faiss_index.is_built:
+    chunks = chunk_by_words(doc_text, max_words=400, overlap=60)
+    if not chunks:
         return []
 
-    # Bi-encoder recall
-    pool = faiss_index.search(query, top_k=_CLOUD_RERANK_POOL)
+    bm25 = BM25Okapi(chunks)
+    pool = bm25.top_n(query, n=min(_CLOUD_RERANK_POOL, len(chunks)))
+    if not pool:
+        # Query shares no vocabulary with the doc — fall back to leading chunks
+        pool = [(i, 0.0) for i in range(min(_CLOUD_TOP_K, len(chunks)))]
 
     # Cross-encoder rerank if retrieval_engine has one loaded
     if (
@@ -138,26 +101,26 @@ def _retrieve_doc_chunks_cloud(query: str, doc_text: str) -> List[Citation]:
         and retrieval_engine._cross_encoder is not None
         and len(pool) > 1
     ):
-        pairs  = [(query, chunk.text) for chunk, _ in pool]
+        pairs  = [(query, chunks[i]) for i, _ in pool]
         scores = retrieval_engine._cross_encoder.predict(pairs)
         ranked = sorted(
-            zip([c for c, _ in pool], scores),
+            zip([i for i, _ in pool], scores),
             key=lambda x: x[1],
             reverse=True,
         )[:_CLOUD_TOP_K]
     else:
-        ranked = [(chunk, score) for chunk, score in pool[:_CLOUD_TOP_K]]
+        ranked = pool[:_CLOUD_TOP_K]
 
-    citations = []
-    for chunk, score in ranked:
-        citations.append(Citation(
+    return [
+        Citation(
             source       = "Uploaded Document",
-            section      = chunk.section or "Document",
-            text         = chunk.text,
-            page         = chunk.index,
+            section      = "Document",
+            text         = chunks[i],
+            page         = i,
             rerank_score = float(score),
-        ))
-    return citations
+        )
+        for i, score in ranked
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +133,7 @@ async def handle_rag_inference(payload: QueryRequest):
     Cloud RAG inference pipeline routing execution payloads dynamically based on intent.
     """
     logger.info("Cloud pipeline request incoming: intent=%s", payload.intent)
+    _t0 = time.perf_counter()
 
     try:
         if not llm_engine:
@@ -195,12 +159,25 @@ async def handle_rag_inference(payload: QueryRequest):
             except Exception as e:
                 logger.warning("Pinecone infrastructure retrieval failed: %s", e)
 
-        # Uploaded document (FAISS) — EXTRACT, HYBRID
-        if payload.intent in ("EXTRACT", "HYBRID") and payload.doc_text:
+        # Explicit flag from the frontend, plus legacy substring sniffing for
+        # any older client that doesn't send doc_is_prechunked yet.
+        is_client_preformatted = bool(payload.doc_text) and (
+            payload.doc_is_prechunked
+            or "Document Chunks" in payload.doc_text
+            or "System:" in payload.doc_text
+        )
+
+        # Uploaded document — EXTRACT, HYBRID. Only when the frontend sent RAW
+        # text; pre-retrieved chunks must never be re-chunked server-side.
+        if (
+            payload.intent in ("EXTRACT", "HYBRID")
+            and payload.doc_text
+            and not is_client_preformatted
+        ):
             try:
                 doc_citations = _retrieve_doc_chunks_cloud(payload.query, payload.doc_text)
             except Exception as e:
-                logger.warning("Doc-level local FAISS extraction failed: %s", e)
+                logger.warning("Doc-level chunk selection failed: %s", e)
 
         # =================================================================
         # 2. PROMPT CONSTRUCTION
@@ -208,23 +185,22 @@ async def handle_rag_inference(payload: QueryRequest):
         execution_path = ""
         prompt_string = ""
 
-        # Check if the incoming payload text contains pre-formatted client-side RAG blocks
-        is_client_preformatted = payload.doc_text and ("Document Chunks" in payload.doc_text or "System:" in payload.doc_text)
-
         if is_client_preformatted:
             # Clean optimization pass: use pre-compiled chunk layout directly
             execution_path = f"Cloud Orchestrated · Gemini Pro · {payload.intent} (Client Edge Chunks Optimized)"
-            
+
+            reg_context = ""
             if payload.intent == "HYBRID" and reg_citations:
-                # Splice in backend regulatory contexts natively next to pre-formatted local chunks
-                reg_context = "\n\n".join([f"Regulatory Chunk (score {c.rerank_score:.3f}):\n{c.text}" for c in reg_citations])
-                prompt_string = (
-                    f"{payload.doc_text}\n\n"
-                    f"Regulatory Context Additions:\n{reg_context}\n\n"
-                    f"Question: {payload.query}"
+                reg_context = "\n\n".join(
+                    f"Regulatory Chunk (score {c.rerank_score:.3f}):\n{c.text}"
+                    for c in reg_citations
                 )
-            else:
-                prompt_string = f"{payload.doc_text}\n\nQuestion: {payload.query}"
+            prompt_string = PromptBuilder.preformatted_prompt(
+                query=payload.query,
+                doc_context=payload.doc_text,
+                reg_context=reg_context,
+                doc_type=payload.doc_type,
+            )
         else:
             # Full fallback framework processing path if raw full string text is injected
             if payload.intent == "HYBRID":
@@ -269,25 +245,24 @@ async def handle_rag_inference(payload: QueryRequest):
         raw_answer = llm_engine.generate_text(prompt=prompt_string)
 
         # =================================================================
-        # 4. UNMASK RESPONSE & CITATIONS
-        # Handles both text generation blocks and citation card arrays 
-        # so the client UI completely bypasses any missing replacement fields.
+        # 4. RESPONSE — returned MASKED. Unmasking happens on the analyst's
+        # machine; this service never holds the placeholder→original map.
         # =================================================================
-        answer_text = _unmask_text(raw_answer, payload.masked_items)
-
-        # Unmask text fields inside the citation mappings to hide raw placeholders
         for c in doc_citations + reg_citations:
-            unmasked_citation_text = _unmask_text(c.text, payload.masked_items)
             citations_output.append({
                 "source":       c.source,
                 "section":      c.section,
                 "page":         c.page,
-                "text":         unmasked_citation_text,  # ✅ Clear text for expanding UI source components
+                "text":         c.text,
                 "rerank_score": c.rerank_score,
             })
 
+        record_telemetry(
+            payload.intent, execution_path, int((time.perf_counter() - _t0) * 1000)
+        )
+
         return QueryResponse(
-            answer=answer_text,
+            answer=raw_answer,
             path=execution_path,
             citations=citations_output,
         )

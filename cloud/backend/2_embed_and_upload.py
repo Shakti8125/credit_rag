@@ -1,13 +1,17 @@
 import os
+import sys
 import json
-import logging
-from dotenv import load_dotenv
+from pathlib import Path
 from pinecone import Pinecone
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
-load_dotenv()
+from shared.env import get_env
+from shared.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 STAGING_FILE = "./chunks_staging.json"
 NAMESPACE = "cbuae-manuals"
@@ -23,7 +27,7 @@ def embed_and_upload_cloud():
 
     logger.info(f"Loaded {len(documents)} chunks. Connecting to Pinecone...")
 
-    api_key = os.getenv("PINECONE_API_KEY")
+    api_key = get_env("PINECONE_API_KEY")
     pc = Pinecone(api_key=api_key)
     
     # IMPORTANT: Update this Host URL to your new 1024-dimension index URL

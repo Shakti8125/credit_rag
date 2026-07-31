@@ -8,24 +8,17 @@ Used ONLY for GENERAL and HYBRID intents where the query needs regulatory
 grounding. EXTRACT intent queries the uploaded document via LocalDocumentIndex
 (local_index.py) instead.
 
-Environment variables (loaded from cloud/backend/.env):
+Environment variables (loaded from project-root .env via shared.env):
     PINECONE_API_KEY
     PINECONE_INDEX_NAME   (default: "creditrag")
     PINECONE_NAMESPACE    (default: "cbuae-manuals")
 """
 
-import os
 import logging
-from pathlib import Path
 from typing import List
 
-from dotenv import load_dotenv
 from local.rag.chunker import TextChunk
-
-# Load .env from project root / cloud / backend
-_current_dir  = Path(__file__).resolve().parent
-_project_root = _current_dir.parent.parent
-load_dotenv(dotenv_path=_project_root / "cloud" / "backend" / ".env")
+from shared.env import get_env
 
 logger = logging.getLogger(__name__)
 
@@ -40,19 +33,20 @@ class PineconeRetriever:
     def __init__(self):
         from pinecone import Pinecone
 
-        api_key = os.getenv("PINECONE_API_KEY")
+        from shared.paths import ENV_FILE
+
+        api_key = get_env("PINECONE_API_KEY")
         if not api_key:
             raise ValueError(
-                f"PINECONE_API_KEY is missing. "
-                f"Check .env at: {_project_root / 'cloud' / 'backend' / '.env'}"
+                f"PINECONE_API_KEY is missing. Check .env at: {ENV_FILE}"
             )
 
         self.pc        = Pinecone(api_key=api_key)
-        self.index     = self.pc.Index(os.getenv("PINECONE_INDEX_NAME", "creditrag"))
-        self.namespace = os.getenv("PINECONE_NAMESPACE", "cbuae-manuals")
+        self.index     = self.pc.Index(get_env("PINECONE_INDEX_NAME", "creditrag"))
+        self.namespace = get_env("PINECONE_NAMESPACE", "cbuae-manuals")
         logger.info(
             "PineconeRetriever connected: index=%s namespace=%s",
-            os.getenv("PINECONE_INDEX_NAME", "creditrag"), self.namespace,
+            get_env("PINECONE_INDEX_NAME", "creditrag"), self.namespace,
         )
 
     def search(self, query: str, top_k: int = 20) -> List[TextChunk]:

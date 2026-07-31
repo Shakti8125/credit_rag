@@ -10,8 +10,9 @@ RAG chunking for financial/regulatory documents.
 
 import re
 import logging
-from dataclasses import dataclass
 from typing import List
+
+from shared.chunking import TextChunk
 
 logger = logging.getLogger(__name__)
 
@@ -29,17 +30,6 @@ HEADERS_TO_SPLIT = [
     ("###",  "h3"),
     ("####", "h4"),
 ]
-
-
-@dataclass
-class TextChunk:
-    text:       str
-    index:      int
-    section:    str = ""
-    word_count: int = 0
-
-    def __post_init__(self):
-        self.word_count = len(self.text.split())
 
 
 # ---------------------------------------------------------------------------

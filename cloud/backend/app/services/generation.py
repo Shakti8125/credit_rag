@@ -2,6 +2,7 @@ import logging
 from google import genai
 from google.genai import types
 from app.services.secrets import get_secret
+from shared.env import get_env
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +22,7 @@ class GenerationService:
         self.client   = genai.Client(api_key=api_key)
         # Read model from env so you can override without code change.
         # gemini-1.5-flash: separate free-tier quota from gemini-2.0-flash.
-        import os
-        self.model_id = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        self.model_id = get_env("GEMINI_MODEL", "gemini-2.5-flash")
         logger.info("GenerationService ready: model=%s", self.model_id)
 
     def generate_text(

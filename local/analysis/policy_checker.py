@@ -111,11 +111,34 @@ _BASEL_THRESHOLDS = [
     ("npa_ratio",    "NPA Ratio",                5.0,  "max", "%",   "Regulatory Concern Threshold (NPA > 5%)",           10),
 ]
 
+# Model performance — CBUAE Model Management Guidelines are principles-based
+# (no hard numeric floors), so these are the industry-standard validation
+# thresholds banks apply when implementing the MMG's discrimination and
+# stability requirements. Sources labelled accordingly.
+_MODEL_VALIDATION_THRESHOLDS = [
+    ("gini",     "Gini Coefficient",            40.0,  "min", "%",   "CBUAE MMG discrimination standard (industry norm: Gini ≥ 40%)",  10),
+    ("auc",      "AUC / AUROC",                  0.70, "min", "",    "CBUAE MMG discrimination standard (industry norm: AUC ≥ 0.70)",   5),
+    ("ks_stat",  "KS Statistic",                30.0,  "min", "%",   "CBUAE MMG discrimination standard (industry norm: KS ≥ 30%)",    10),
+    # warning buffer 40% of 0.25 → values above 0.15 flag as WARNING,
+    # approximating the conventional 0.10–0.25 "monitor" band
+    ("psi",      "Population Stability Index",   0.25, "max", "",    "CBUAE MMG stability standard (PSI ≤ 0.25; 0.10–0.25 = monitor)", 40),
+]
+
+# IFRS 9 ECL / staging — supervisory comfort levels for staging mix and
+# Stage 3 provisioning coverage.
+_IFRS9_THRESHOLDS = [
+    ("ecl_coverage",  "Stage 3 / ECL Coverage",  50.0, "min", "%",   "IFRS 9 supervisory norm (Stage 3 provision coverage ≥ 50%)",     10),
+    ("stage2_ratio",  "Stage 2 Ratio",           20.0, "max", "%",   "IFRS 9 SICR monitoring norm (Stage 2 share ≤ 20% of book)",      10),
+    ("stage3_ratio",  "Stage 3 Ratio",            5.0, "max", "%",   "IFRS 9 credit-impaired norm (Stage 3 share ≤ 5% of book)",       10),
+]
+
 _THRESHOLD_MAP = {
-    "Internal Credit Proposal (Memo)":         _CREDIT_MEMO_THRESHOLDS + _BASEL_THRESHOLDS,
-    "Corporate Financial Statement":           _FINANCIAL_STATEMENT_THRESHOLDS + _BASEL_THRESHOLDS,
-    "CBUAE Regulatory Framework / Policy":     _BASEL_THRESHOLDS,
-    "General Risk Analytics Dossier":          _CREDIT_MEMO_THRESHOLDS + _FINANCIAL_STATEMENT_THRESHOLDS + _BASEL_THRESHOLDS,
+    "Internal Credit Proposal (Memo)":         _CREDIT_MEMO_THRESHOLDS + _BASEL_THRESHOLDS + _IFRS9_THRESHOLDS,
+    "Corporate Financial Statement":           _FINANCIAL_STATEMENT_THRESHOLDS + _BASEL_THRESHOLDS + _IFRS9_THRESHOLDS,
+    "CBUAE Regulatory Framework / Policy":     _BASEL_THRESHOLDS + _IFRS9_THRESHOLDS,
+    "General Risk Analytics Dossier":          (_CREDIT_MEMO_THRESHOLDS + _FINANCIAL_STATEMENT_THRESHOLDS
+                                                + _BASEL_THRESHOLDS + _MODEL_VALIDATION_THRESHOLDS
+                                                + _IFRS9_THRESHOLDS),
 }
 
 

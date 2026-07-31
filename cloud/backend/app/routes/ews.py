@@ -6,29 +6,17 @@ POST /ews
 """
 
 import logging
-import numpy as np
+import time
 from typing import Optional, List, Dict, Any
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
-from app.services.generation import GenerationService
-from app.services.retrieval  import PineconeRetrievalService, Citation
+from app.services.engines  import llm_engine as _llm, retrieval_engine as _retrieval, record_telemetry
+from app.services.doc_search import chunk_text, hybrid_search
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-try:
-    _llm = GenerationService()
-except Exception as e:
-    logger.warning("GenerationService unavailable: %s", e)
-    _llm = None
-
-try:
-    _retrieval = PineconeRetrievalService()
-except Exception as e:
-    logger.warning("PineconeRetrievalService unavailable: %s", e)
-    _retrieval = None
 
 _TOP_K       = 8
 _RERANK_POOL = 25
@@ -51,7 +39,6 @@ class EWSRequest(BaseModel):
     doc_text:      str
     doc_label:     Optional[str]            = "Uploaded Document"
     doc_type:      Optional[str]            = "Internal Credit Proposal (Memo)"
-    masked_items:  Optional[Dict[str, str]] = None
     local_signals: Optional[List[Dict]]    = None
     query:         Optional[str]            = ""
 
@@ -63,42 +50,7 @@ class EWSResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Self-contained chunker (mirrors compare.py — no local.* dependency)
-# ---------------------------------------------------------------------------
-
-def _chunk_text(text: str) -> List[str]:
-    if not text or not text.strip():
-        return []
-
-    separators = ["\n\n", "\n", ". ", " ", ""]
-    chunks: List[str] = []
-
-    def _split(s: str, sep_idx: int):
-        if len(s) <= _CHUNK_SIZE:
-            if s.strip():
-                chunks.append(s.strip())
-            return
-        sep   = separators[sep_idx] if sep_idx < len(separators) else ""
-        parts = s.split(sep) if sep else list(s)
-        current = ""
-        for part in parts:
-            add = part + (sep if sep else "")
-            if len(current) + len(add) <= _CHUNK_SIZE:
-                current += add
-            else:
-                if current.strip():
-                    chunks.append(current.strip())
-                overlap = current[-_CHUNK_OVER:] if len(current) > _CHUNK_OVER else current
-                current = overlap + add
-        if current.strip():
-            chunks.append(current.strip())
-
-    _split(text, 0)
-    return [c for c in chunks if len(c.split()) >= 8]
-
-
-# ---------------------------------------------------------------------------
-# Self-contained FAISS (no local.* dependency)
+# Retrieval — chunking + hybrid search delegated to app.services.doc_search
 # ---------------------------------------------------------------------------
 
 def _build_and_search(
@@ -107,76 +59,23 @@ def _build_and_search(
     label:    str,
 ) -> List[Dict[str, Any]]:
     """
-    Chunks doc_text, builds FAISS index, retrieves top-k, cross-encoder reranks.
-    Returns list of {"text": str, "score": float, "chunk_idx": int}.
+    Chunks doc_text and runs hybrid (dense + BM25, RRF-fused, cross-encoder
+    reranked) retrieval. Returns [{"text", "score", "chunk_idx"}].
     """
-    chunks = _chunk_text(doc_text)
+    chunks = chunk_text(doc_text, _CHUNK_SIZE, _CHUNK_OVER)
     if not chunks:
         logger.warning("EWS: chunker produced 0 chunks for '%s'.", label)
         return []
 
-    try:
-        import faiss
-        from sentence_transformers import SentenceTransformer
-
-        model      = SentenceTransformer("all-MiniLM-L6-v2")
-        embeddings = model.encode(
-            chunks,
-            batch_size=32,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-        ).astype(np.float32)
-
-        dim   = embeddings.shape[1]
-        index = faiss.IndexFlatIP(dim)
-        index.add(embeddings)
-
-        fetch_k = min(_RERANK_POOL, len(chunks))
-        q_vec   = model.encode(
-            [query], normalize_embeddings=True, convert_to_numpy=True
-        ).astype(np.float32)
-
-        scores, indices = index.search(q_vec, fetch_k)
-
-        candidates = [
-            {"text": chunks[i], "score": float(s), "chunk_idx": int(i)}
-            for s, i in zip(scores[0], indices[0])
-            if i >= 0
-        ]
-
-        # Cross-encoder rerank
-        if _retrieval is not None and _retrieval._cross_encoder is not None and len(candidates) > 1:
-            try:
-                pairs     = [(query, c["text"]) for c in candidates]
-                ce_scores = _retrieval._cross_encoder.predict(pairs)
-                for cand, ce_s in zip(candidates, ce_scores):
-                    cand["score"] = float(ce_s)
-                candidates.sort(key=lambda c: c["score"], reverse=True)
-            except Exception as e:
-                logger.warning("EWS cross-encoder reranking failed: %s", e)
-
-        logger.info("EWS FAISS: %d chunks indexed, %d retrieved for '%s'.", len(chunks), len(candidates[:_TOP_K]), label)
-        return candidates[:_TOP_K]
-
-    except ImportError as e:
-        logger.error("faiss-cpu or sentence-transformers missing: %s", e)
-        return []
-    except Exception as e:
-        logger.error("EWS FAISS error for '%s': %s", label, e, exc_info=True)
-        return []
+    _ce = _retrieval._cross_encoder if _retrieval is not None else None
+    return hybrid_search(query, chunks, _TOP_K, _RERANK_POOL,
+                         cross_encoder=_ce, label=label)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _unmask(text: str, masked_items: Optional[Dict[str, str]]) -> str:
-    if not masked_items or not text:
-        return text
-    for ph in sorted(masked_items.keys(), key=len, reverse=True):
-        text = text.replace(ph, masked_items[ph])
-    return text
 
 
 def _format_local_signals(signals: Optional[List[Dict]]) -> str:
@@ -260,6 +159,8 @@ async def handle_ews_analysis(payload: EWSRequest):
     if not payload.doc_text.strip():
         raise HTTPException(status_code=400, detail="doc_text is empty.")
 
+    _t0 = time.perf_counter()
+
     try:
         ews_query = payload.query.strip() if payload.query else _EWS_DEFAULT_QUERY
 
@@ -288,22 +189,26 @@ async def handle_ews_analysis(payload: EWSRequest):
         # ── Generate ──────────────────────────────────────────────────
         raw_answer = _llm.generate_text(prompt=prompt, max_tokens=8192)
 
-        # ── Unmask STRICTLY after generation ──────────────────────────
-        answer = _unmask(raw_answer, payload.masked_items)
-
+        # Response returned MASKED — the frontend unmasks locally; this
+        # service never holds the placeholder→original map.
         citations = [
             {
                 "source":       payload.doc_label or "Document",
                 "section":      f"Chunk {r['chunk_idx']+1}",
                 "page":         r["chunk_idx"],
-                "text":         _unmask(r["text"], payload.masked_items),
+                "text":         r["text"],
                 "rerank_score": r["score"],
             }
             for r in results
         ]
 
+        # Fixed path string for telemetry, not the returned one — doc_label is
+        # a client-supplied filename and must not reach the telemetry ledger.
+        record_telemetry("EWS", "Cloud EWS · Gemini",
+                         int((time.perf_counter() - _t0) * 1000))
+
         return EWSResponse(
-            answer    = answer,
+            answer    = raw_answer,
             path      = f"Cloud EWS · {payload.doc_label} · Gemini",
             citations = citations,
         )
