@@ -167,6 +167,12 @@ Two roles:
   (`token.actions.githubusercontent.com`), scoped to `repo:<owner>/<repo>:*`, permitted only to
   push this ECR repository and update this one function. No long-lived AWS keys in GitHub.
 
+  On the Lambda side it needs `lambda:GetFunction`, **`lambda:GetFunctionConfiguration`**,
+  `lambda:UpdateFunctionCode` and `lambda:PublishVersion`. `GetFunctionConfiguration` is easy to
+  miss — it is a *separate* IAM action from `GetFunction`, and it is what `aws lambda wait
+  function-updated` calls. Without it the deploy step fails **after** the code has already been
+  updated, which looks alarming and isn't.
+
 ## Step 4 — Build and push (GitHub Actions)
 
 Set repo variables under **Settings → Secrets and variables → Actions → Variables**:
