@@ -1,278 +1,295 @@
-# Deploying CreditRAG on AWS (Free Tier)
+# Deploying CreditRAG on AWS
 
-This guide deploys the **cloud tier only** (`cloud/backend/` + `shared/`). The local tier (Streamlit + privacy pipeline + Phi-3) is designed to run on the analyst's machine and should **not** be deployed — moving it to the cloud would defeat the on-device masking guarantee, and the 2.2 GB GGUF model won't fit free-tier compute anyway.
+This deploys the **cloud tier only** (`cloud/backend/` + `shared/`). The local tier — Streamlit,
+privacy pipeline, Phi-3 — is designed to run on the analyst's machine and must **not** be
+deployed: moving it to the cloud would defeat the on-device masking guarantee, and the 2.2 GB
+GGUF won't fit free-tier compute anyway.
 
-The codebase is already AWS-ready:
+This document describes the deployment that is **actually running**, not a proposal. Every
+command here was executed against a real account. Region is `ap-south-1` (Mumbai).
 
-- [app/main.py](cloud/backend/app/main.py) exposes `handler = Mangum(app)` for Lambda.
-- [app/services/secrets.py](cloud/backend/app/services/secrets.py) reads secrets from **SSM Parameter Store** (region `ap-south-1`), falling back to env vars locally.
-- [app/services/dynamo.py](cloud/backend/app/services/dynamo.py) logs telemetry to DynamoDB table `CreditRAG_Telemetry` (optional; degrades gracefully).
-- [app/routes/health.py](cloud/backend/app/routes/health.py) is a liveness probe usable for warmup pings.
-- [cloud/infra/template.yaml](cloud/infra/template.yaml) and [.github/workflows/deploy.yml](.github/workflows/deploy.yml) are currently **empty stubs** — this guide gives you the manual path plus a SAM template to fill the stub.
-
-External dependencies (not AWS, both have free tiers): **Pinecone** (serverless starter) and **Google Gemini** (AI Studio free tier).
+External dependencies (not AWS, both free-tier): **Pinecone** serverless and **Google Gemini**
+(AI Studio).
 
 ---
 
-## Recommended Architecture: Lambda Container + Function URL
+## Architecture
 
 ```
-Analyst machine (Streamlit, CLOUD_API_BASE=<Function URL>)
-        │  HTTPS (masked payloads only)
+Analyst machine (Streamlit)
+        │  HTTPS + X-API-Key, masked payloads only
         ▼
-Lambda Function URL  ── free, no API Gateway needed
+Lambda Function URL  (AuthType NONE; auth enforced in-app)
         ▼
-Lambda (container image from ECR, 1024–2048 MB)
-   ├── SSM Parameter Store  (GEMINI_API_KEY, PINECONE_API_KEY)
-   ├── Pinecone  (regulatory corpus, external)
-   ├── Gemini API  (generation, external)
-   └── DynamoDB CreditRAG_Telemetry  (optional)
+Lambda container, 2048 MB / 300 s, from ECR
+   ├── SSM Parameter Store  GEMINI_API_KEY, PINECONE_API_KEY, CREDITRAG_API_KEY
+   ├── Pinecone             regulatory corpus, ns "cbuae-manuals"
+   ├── Gemini API           generation
+   └── DynamoDB             CreditRAG_Telemetry (intent/path/latency only)
+
+git push to main ──▶ GitHub Actions (OIDC) ──▶ build ──▶ ECR ──▶ update-function-code
 ```
 
-**Why this shape for free tier:**
+Building in Actions means the ~2 GB image never crosses a home connection, and no local Docker
+daemon is needed.
 
-| Component | Free-tier coverage |
+### Measured characteristics
+
+| | |
 |---|---|
-| Lambda | 1 M requests + 400,000 GB-seconds/month, **always free**. At 1536 MB that's ~74 hours of compute/month — far more than a demo needs. |
-| Lambda Function URL | Free (vs. API Gateway, which is only free for 12 months). Gives you a public HTTPS endpoint with zero extra infrastructure. |
-| SSM Parameter Store | Standard parameters: free. |
-| DynamoDB | 25 GB + 25 RCU/WCU always free. |
-| CloudWatch Logs | 5 GB ingestion/month free. |
-| ECR | 500 MB private storage free. **This is the one place you'll exceed free tier** — the image (torch + sentence-transformers + baked-in models) is ~2–3 GB, costing roughly **$0.10/GB-month ≈ $0.20–0.30/month**. Effectively free, but not literally zero. |
+| Image size (compressed in ECR) | 767 MB |
+| Full CI pipeline (evals + build + push) | ~4.5 min |
+| Cold start (image pull + 2 model loads) | ~25 s |
+| Warm `/health` | ~0.34 s |
+| Warm `/query` end-to-end (BENCHMARK) | 8–15 s, p95 14.6 s |
 
-The honest caveats up front:
+---
 
-1. **Cold starts will be slow** (30–60 s: image pull + cross-encoder/embedder load). Fine for a demo; mitigate with a warmup ping (below). Don't pay for provisioned concurrency on free tier.
-2. **`/compare` and `/ews` can run long.** Set Lambda timeout to the max relevant value (up to 900 s; Function URLs cap responses at ~15 min). The frontend already uses generous request timeouts.
-3. **Region:** `secrets.py` and `dynamo.py` hardcode `ap-south-1` (Mumbai). Deploy there, or change those two defaults.
+## Four traps, and why they bite
+
+These cost real debugging time. They are the reason this guide exists in this form.
+
+### 1. The base image must be `python:3.12`, not `python:3.11`
+
+Lambda's `python:3.11` base image runs on **Amazon Linux 2 (glibc 2.26)**. AL2023 (glibc 2.34)
+arrives only with `python:3.12`.
+
+numpy, faiss-cpu and tiktoken now publish x86_64 Linux wheels exclusively under
+`manylinux_2_27` / `manylinux_2_28` tags, which need glibc ≥ 2.27. On the 3.11 image **not one of
+them is installable**, so pip silently falls back to source tarballs and the build dies in meson
+with `Unknown compiler(s)` — Lambda base images carry no C toolchain. Pinning older package
+versions works today and rots quickly; the whole scientific stack has moved to the 2.28 floor.
+
+### 2. pip must be upgraded before anything is installed
+
+The base image ships pip 24.0, which predates `Metadata-Version 2.4` and treats wheels carrying
+it as incompatible — the same silent sdist fallback by a different route. `pip install --upgrade
+pip` is the first instruction in the Dockerfile for this reason.
+
+### 3. A public Function URL needs **two** policy statements
+
+> Starting October 2025, new function URLs require both `lambda:InvokeFunctionUrl` **and**
+> `lambda:InvokeFunction`.
+
+With only the first, every request returns `403 AccessDeniedException` — before reaching your
+code — even though `AuthType` is `NONE` and the policy looks textbook-correct. The two statements
+use **different CLI flags**; `--function-url-auth-type` is rejected for the `InvokeFunction`
+action.
+
+### 4. `.dockerignore` is mandatory here
+
+Both Dockerfiles build from the project root, where the context is **3.8 GB** (2.3 GB Phi-3 GGUF,
+1.6 GB `.git`, 17 MB of source PDFs). Without [.dockerignore](.dockerignore), every build ships
+all of it to the builder before the first instruction runs.
+
+---
+
+## Files that make this work
+
+| File | Role |
+|---|---|
+| [.dockerignore](.dockerignore) | Deny-all + allow-list for `shared/` and `cloud/backend/{app,requirements*}`. |
+| [Dockerfile.lambda](cloud/backend/Dockerfile.lambda) | AL2023 base, CPU-only torch installed **before** sentence-transformers so pip never resolves the ~2.5 GB CUDA wheel, cross-encoder + MiniLM baked in, `HF_HUB_OFFLINE=1` so cold starts do no network I/O against a read-only filesystem. |
+| [requirements-lambda.txt](cloud/backend/requirements-lambda.txt) | Drops `docling` (ingestion-only, pulls torchvision) and `uvicorn` (nothing imports it; Mangum is the adapter). |
+| [app/auth.py](cloud/backend/app/auth.py) | `X-API-Key` shared secret from SSM, constant-time compared. Self-disables when unset, so local dev and offline evals are unaffected. |
+| [deploy.yml](.github/workflows/deploy.yml) | OIDC → ECR → Lambda, gated on the privacy + adversarial masking evals. |
 
 ---
 
 ## Step 0 — Prerequisites
 
-- AWS account (new accounts get the 12-month free tier on top of always-free services), AWS CLI v2 configured (`aws configure`, region `ap-south-1`), Docker running.
-- Pinecone index already populated (run `1_extract_and_chunk.py` + `2_embed_and_upload.py` once from your machine — ingestion never needs to run in AWS).
+- AWS account with an IAM admin user (**not root**), root MFA enabled, AWS CLI v2 configured for
+  `ap-south-1`.
+- Pinecone index already populated — run `1_extract_and_chunk.py` then `2_embed_and_upload.py`
+  once from your machine. Ingestion never runs in AWS. Verify:
 
-## Step 1 — Store secrets in SSM Parameter Store
+  ```bash
+  python -c "from pinecone import Pinecone; from shared.env import get_env; \
+    print(Pinecone(api_key=get_env('PINECONE_API_KEY')).Index('creditrag').describe_index_stats())"
+  ```
 
-```bash
-aws ssm put-parameter --name GEMINI_API_KEY   --type SecureString --value "YOUR_GEMINI_KEY"   --region ap-south-1
-aws ssm put-parameter --name PINECONE_API_KEY --type SecureString --value "YOUR_PINECONE_KEY" --region ap-south-1
-```
+  Expect ~1,566 vectors, dimension 1024, namespace `cbuae-manuals`.
 
-`get_secret()` looks up parameters **by these exact names**. SecureString uses the default AWS-managed KMS key — free.
+## Step 1 — Budget alarm first
 
-Note: `retrieval.py` reads `PINECONE_API_KEY` via `get_env` (plain env), not via `get_secret`. Easiest fix without code changes: pass it as a Lambda environment variable (Step 4). `GEMINI_API_KEY` goes through SSM properly.
-
-## Step 2 — Build a Lambda-compatible image
-
-The existing [Dockerfile](cloud/backend/Dockerfile) targets uvicorn. Its header comment already describes the Lambda variant; create `cloud/backend/Dockerfile.lambda`:
-
-```dockerfile
-FROM public.ecr.aws/lambda/python:3.11
-
-COPY cloud/backend/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# shared/ next to app/ so `import shared` and `import app` both resolve
-COPY shared/   ${LAMBDA_TASK_ROOT}/shared/
-COPY cloud/backend/app/ ${LAMBDA_TASK_ROOT}/app/
-
-# Bake models into the image so cold starts don't download them.
-# HF cache must be somewhere readable at runtime; /tmp is wiped, so use a
-# baked path and point HF_HOME at it.
-ENV HF_HOME=/opt/hf-cache
-RUN python -c "from sentence_transformers import CrossEncoder, SentenceTransformer; \
-    CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2'); \
-    SentenceTransformer('all-MiniLM-L6-v2')"
-
-CMD ["app.main.handler"]
-```
-
-Build **from the project root** (so `shared/` is in context):
+Before anything can spend. `$5` cap, alerts at 20 % actual and at forecast-to-exceed:
 
 ```bash
-docker build -f cloud/backend/Dockerfile.lambda -t creditrag-backend:lambda .
+aws budgets create-budget --account-id <ACCOUNT_ID> \
+  --budget file://budget.json --notifications-with-subscribers file://notifications.json
 ```
 
-Tip to shave image size (and ECR cost): install CPU-only torch by adding `--extra-index-url https://download.pytorch.org/whl/cpu` to the pip install, and drop `docling` from the deployed requirements (it's only used by the ingestion scripts, which run on your machine).
+## Step 2 — Secrets in SSM Parameter Store
 
-## Step 3 — Push to ECR
+```bash
+for n in GEMINI_API_KEY PINECONE_API_KEY CREDITRAG_API_KEY; do
+  aws ssm put-parameter --name $n --type SecureString --value "..." --region ap-south-1
+done
+```
+
+`CREDITRAG_API_KEY` is a fresh 32-byte random token — the shared secret for the `X-API-Key`
+header. Generate it, don't reuse anything. SecureString uses the default AWS-managed KMS key, free.
+
+Both [generation.py](cloud/backend/app/services/generation.py) and
+[retrieval.py](cloud/backend/app/services/retrieval.py) resolve their keys through
+[`get_secret()`](cloud/backend/app/services/secrets.py), which reads the environment first and
+falls back to SSM — so no key ever needs to sit in a plaintext Lambda environment variable, and
+local development is unchanged.
+
+## Step 3 — ECR, DynamoDB, IAM
 
 ```bash
 aws ecr create-repository --repository-name creditrag-backend --region ap-south-1
-
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.ap-south-1.amazonaws.com
-
-docker tag creditrag-backend:lambda ${ACCOUNT_ID}.dkr.ecr.ap-south-1.amazonaws.com/creditrag-backend:latest
-docker push ${ACCOUNT_ID}.dkr.ecr.ap-south-1.amazonaws.com/creditrag-backend:latest
+aws ecr put-lifecycle-policy --repository-name creditrag-backend \
+  --lifecycle-policy-text file://ecr-lifecycle.json   # keep last 3 images
 ```
 
-## Step 4 — Create the Lambda function
-
-Execution role (basic logs + SSM read):
-
-```bash
-aws iam create-role --role-name creditrag-lambda-role \
-  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-
-aws iam attach-role-policy --role-name creditrag-lambda-role \
-  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-
-aws iam put-role-policy --role-name creditrag-lambda-role --policy-name ssm-read \
-  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ssm:GetParameter"],"Resource":"*"}]}'
-```
-
-Function (1536 MB is the sweet spot: enough RAM for the reranker + embedder, and more memory = proportionally more CPU = faster model load):
-
-```bash
-aws lambda create-function \
-  --function-name creditrag-backend \
-  --package-type Image \
-  --code ImageUri=${ACCOUNT_ID}.dkr.ecr.ap-south-1.amazonaws.com/creditrag-backend:latest \
-  --role arn:aws:iam::${ACCOUNT_ID}:role/creditrag-lambda-role \
-  --memory-size 1536 --timeout 300 \
-  --environment "Variables={PINECONE_API_KEY=YOUR_PINECONE_KEY,PINECONE_INDEX_NAME=creditrag,GEMINI_MODEL=gemini-2.5-flash,CORS_ALLOW_ORIGINS=*,HF_HOME=/opt/hf-cache}" \
-  --region ap-south-1
-```
-
-(If you'd rather not put the Pinecone key in env vars, add a `get_secret()` call for it in `retrieval.py` — a two-line change.)
-
-## Step 5 — Public HTTPS endpoint (Function URL)
-
-```bash
-aws lambda create-function-url-config \
-  --function-name creditrag-backend \
-  --auth-type NONE \
-  --region ap-south-1
-
-aws lambda add-permission \
-  --function-name creditrag-backend \
-  --statement-id public-url --action lambda:InvokeFunctionUrl \
-  --principal "*" --function-url-auth-type NONE \
-  --region ap-south-1
-```
-
-This returns a URL like `https://xxxx.lambda-url.ap-south-1.on.aws/`. Test it:
-
-```bash
-curl https://xxxx.lambda-url.ap-south-1.on.aws/health
-curl -X POST https://xxxx.lambda-url.ap-south-1.on.aws/query \
-  -H "Content-Type: application/json" \
-  -d '{"query":"What is the minimum CET1 ratio under Basel III?","intent":"BENCHMARK"}'
-```
-
-> `--auth-type NONE` makes the endpoint public. For anything beyond a demo, switch to `AWS_IAM` or at minimum set `CORS_ALLOW_ORIGINS` to your real origin. Remember: by design the payloads are already masked, which limits the blast radius — but a public endpoint still spends your Gemini/Pinecone quota.
-
-## Step 6 — Point the frontend at it
-
-On the analyst machine:
-
-```bash
-# in .env at project root
-CLOUD_API_BASE=https://xxxx.lambda-url.ap-south-1.on.aws
-```
-
-[local/app/config.py](local/app/config.py) derives `/query`, `/compare`, `/ews` from this base automatically.
-
-## Step 7 — Optional extras (both within always-free tier)
-
-**Telemetry table** (used by `dynamo.py` if present; logs intent/path/latency only, never text):
+The lifecycle policy matters: the image is ~767 MB and ECR's free tier is 500 MB, so unbounded
+history is the one thing here that would actually cost money.
 
 ```bash
 aws dynamodb create-table --table-name CreditRAG_Telemetry \
-  --attribute-definitions AttributeName=transaction_id,AttributeType=S \
-  --key-schema AttributeName=transaction_id,KeyType=HASH \
+  --attribute-definitions AttributeName=LogId,AttributeType=S \
+  --key-schema AttributeName=LogId,KeyType=HASH \
   --billing-mode PAY_PER_REQUEST --region ap-south-1
 ```
 
-Also attach `dynamodb:PutItem` on that table to the Lambda role.
+> The partition key **must** be `LogId` — that is what
+> [dynamo.py](cloud/backend/app/services/dynamo.py) writes. Any other key name makes every write
+> fail with `ValidationException`.
 
-**Warmup ping** to soften cold starts (~9 k invocations/month, negligible against the 1 M free):
+Two roles:
+
+- **`creditrag-lambda-role`** — `AWSLambdaBasicExecutionRole`, plus inline `ssm:GetParameter`
+  scoped to the three parameter ARNs, `kms:Decrypt` conditioned on `kms:ViaService = ssm`, and
+  `dynamodb:PutItem` on the telemetry table only.
+- **`creditrag-github-deploy`** — trusted by the GitHub OIDC provider
+  (`token.actions.githubusercontent.com`), scoped to `repo:<owner>/<repo>:*`, permitted only to
+  push this ECR repository and update this one function. No long-lived AWS keys in GitHub.
+
+## Step 4 — Build and push (GitHub Actions)
+
+Set repo variables under **Settings → Secrets and variables → Actions → Variables**:
+`AWS_ROLE_ARN`, `AWS_REGION`, `ECR_REPOSITORY`, `LAMBDA_FUNCTION`, and `FUNCTION_URL` (optional,
+enables the CI smoke test). Then push to `main` or run the workflow manually.
+
+> `workflow_dispatch` only appears once the workflow file exists on the **default branch**.
+
+The workflow sets `provenance: false`. Without it buildx pushes an OCI image index, which Lambda
+rejects with *"The image manifest, config or layer media type for the source image is not
+supported."*
+
+## Step 5 — Create the function and its URL
 
 ```bash
-aws events put-rule --name creditrag-warmup --schedule-expression "rate(5 minutes)" --region ap-south-1
-aws lambda add-permission --function-name creditrag-backend --statement-id warmup \
-  --action lambda:InvokeFunction --principal events.amazonaws.com \
-  --source-arn arn:aws:events:ap-south-1:${ACCOUNT_ID}:rule/creditrag-warmup --region ap-south-1
-aws events put-targets --rule creditrag-warmup --region ap-south-1 \
-  --targets "Id=1,Arn=arn:aws:lambda:ap-south-1:${ACCOUNT_ID}:function:creditrag-backend,Input='{\"warmup\":true}'"
+aws lambda create-function --function-name creditrag-backend \
+  --package-type Image --code ImageUri=<ACCOUNT>.dkr.ecr.ap-south-1.amazonaws.com/creditrag-backend:<sha> \
+  --role arn:aws:iam::<ACCOUNT>:role/creditrag-lambda-role \
+  --memory-size 2048 --timeout 300 --architectures x86_64 \
+  --environment "Variables={PINECONE_INDEX_NAME=creditrag,GEMINI_MODEL=gemini-2.5-flash,CORS_ALLOW_ORIGINS=*,TELEMETRY_TABLE=CreditRAG_Telemetry}" \
+  --region ap-south-1
 ```
 
-(The raw EventBridge payload isn't an HTTP event, so Mangum will log an error and exit — that's fine, the point is keeping the container warm. For a clean warmup, target the `/health` route via a scheduled `curl` from anywhere instead.)
+- **2048 MB** — Lambda scales CPU with memory, and cold start here is dominated by loading two
+  transformer models.
+- **300 s** deliberately matches the client-side `timeout=300` in the compare/EWS handlers.
+- **`TELEMETRY_TABLE`** is what switches telemetry on;
+  [engines.py](cloud/backend/app/services/engines.py) builds no DynamoDB client when it is unset,
+  so developer machines never attempt a doomed write.
+- Do **not** set `AWS_REGION` — it is reserved and injected automatically.
+
+Then the URL, **both** statements (see trap 3):
+
+```bash
+aws lambda create-function-url-config --function-name creditrag-backend \
+  --auth-type NONE --region ap-south-1
+
+aws lambda add-permission --function-name creditrag-backend \
+  --statement-id UrlPolicyInvokeURL --action lambda:InvokeFunctionUrl \
+  --principal "*" --function-url-auth-type NONE --region ap-south-1
+
+aws lambda add-permission --function-name creditrag-backend \
+  --statement-id UrlPolicyInvokeFunction --action lambda:InvokeFunction \
+  --principal "*" --invoked-via-function-url --region ap-south-1
+```
+
+`AuthType NONE` is safe here because the `X-API-Key` check lives inside the application. IAM auth
+would force the analyst machine to carry AWS credentials and sign requests, which it deliberately
+does not.
+
+## Step 6 — Point the frontend at it
+
+In the project-root `.env` (gitignored):
+
+```
+CLOUD_API_BASE=https://xxxx.lambda-url.ap-south-1.on.aws
+CLOUD_API_KEY=<the CREDITRAG_API_KEY value>
+```
+
+[config.py](local/app/config.py) derives `/query`, `/compare`, `/ews` and the `X-API-Key` header
+from these. Ensure the file ends with a newline — appending to a file without one silently welds
+the new variable onto the previous line.
 
 ---
 
-## Filling the SAM stub (`cloud/infra/template.yaml`)
+## Verification
 
-Once the manual path works, codify it so redeploys are one command. Drop this into the currently empty [template.yaml](cloud/infra/template.yaml):
+```bash
+curl $URL/health                                   # 200, ~25 s cold / ~0.3 s warm
+curl -X POST $URL/query -H 'Content-Type: application/json' \
+     --data-binary @query.json                     # 401 — no key
+curl -X POST $URL/query -H 'Content-Type: application/json' \
+     -H "X-API-Key: $KEY" --data-binary @query.json  # 200 + grounded answer
 
-```yaml
-AWSTemplateFormatVersion: '2010-09-09'
-Transform: AWS::Serverless-2016-10-31
-Description: CreditRAG cloud tier — Lambda container + Function URL
-
-Globals:
-  Function:
-    Timeout: 300
-    MemorySize: 1536
-
-Resources:
-  Backend:
-    Type: AWS::Serverless::Function
-    Properties:
-      PackageType: Image
-      ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/creditrag-backend:latest"
-      FunctionUrlConfig:
-        AuthType: NONE
-      Environment:
-        Variables:
-          PINECONE_INDEX_NAME: creditrag
-          GEMINI_MODEL: gemini-2.5-flash
-          HF_HOME: /opt/hf-cache
-      Policies:
-        - Statement:
-            - Effect: Allow
-              Action: [ssm:GetParameter]
-              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
-            - Effect: Allow
-              Action: [dynamodb:PutItem]
-              Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/CreditRAG_Telemetry"
-
-Outputs:
-  FunctionUrl:
-    Value: !GetAtt BackendUrl.FunctionUrl
+aws logs tail /aws/lambda/creditrag-backend --follow
+aws dynamodb scan --table-name CreditRAG_Telemetry --max-items 5
+python eval/ragas_eval.py --api $URL --sleep 13
 ```
 
-Deploy with `sam deploy --guided` (writes [samconfig.toml](cloud/infra/samconfig.toml)); the GitHub Actions stub ([deploy.yml](.github/workflows/deploy.yml)) can then be `docker build → ecr push → sam deploy` on pushes to `main`, gated on `python eval/privacy_eval.py` passing.
+Telemetry rows must contain only `Intent`, `ExecutionPath`, `LatencyMs`, `LogId`, `Timestamp` —
+never payload text. `/compare` and `/ews` deliberately log a *fixed* path string rather than the
+one they return, because the returned path embeds client-supplied document labels, which
+[adversarial_eval.py](eval/adversarial_eval.py) treats as a PII carrier.
+
+### Gemini free tier will fail the eval gate
+
+`gemini-2.5-flash` on AI Studio allows **20 generate-content requests per day**. The 14-question
+golden set plus any manual testing exceeds that, surfacing as HTTP 500s and an `error_rate` gate
+failure that is **environmental, not a defect**. Confirm by checking for `429 RESOURCE_EXHAUSTED`
+in CloudWatch before investigating anything else. Run the full suite on a fresh day, or on a paid
+key.
+
+Last recorded run (12 of 14 scored; 2 lost to quota): grounding 0.82, citation coverage 1.00,
+expected-term hit rate 1.00, **placeholder leaks 0**, p50 10.0 s / p95 14.6 s.
 
 ---
 
-## Alternative: single EC2 instance (12-month free tier)
-
-If you'd rather avoid cold starts entirely: one `t3.micro`/`t2.micro` (750 hrs/month free for the first 12 months) running the **existing** [Dockerfile](cloud/backend/Dockerfile) as-is:
-
-```bash
-docker build -f cloud/backend/Dockerfile -t creditrag-backend .
-docker run -d --restart unless-stopped --env-file .env -p 80:8000 creditrag-backend
-```
-
-Trade-offs: 1 GB RAM is tight for torch + sentence-transformers — add a 2 GB swap file (`fallocate -l 2G /swapfile …`) and expect the reranker to be slow; no HTTPS out of the box (put it behind Caddy for a free Let's Encrypt cert, or use Cloudflare); and after 12 months a t3.micro is ~$8/month vs. Lambda staying effectively free. **Recommendation: Lambda.** The workload is bursty and analyst-driven — exactly what Lambda's always-free tier is for.
-
-## What NOT to deploy
-
-- `local/` — the whole point is on-device masking; deploying it centralizes raw PII.
-- `base_documents/` + ingestion scripts — run once from your machine; Pinecone holds the result.
-- Any managed vector DB on AWS (OpenSearch, pgvector on RDS) — none of them fit the free tier as comfortably as Pinecone's own starter plan, and the code targets Pinecone.
-
-## Monthly cost summary (steady demo usage)
+## Cost
 
 | Item | Cost |
 |---|---|
-| Lambda compute + requests | $0 (within always-free) |
-| Function URL, SSM, DynamoDB, CloudWatch (≤5 GB logs) | $0 |
-| ECR image storage (~2–3 GB) | ~$0.20–0.30 |
-| Pinecone serverless starter | $0 |
-| Gemini AI Studio free tier | $0 (rate-limited) |
+| Lambda compute + requests | $0 — always-free tier |
+| Function URL, SSM, DynamoDB, CloudWatch (≤5 GB) | $0 |
+| ECR storage (767 MB, last-3 lifecycle policy) | ~$0.08–0.30 |
+| Pinecone starter, Gemini AI Studio | $0 (rate-limited) |
 | **Total** | **≈ $0.30/month** |
+
+## Operational notes
+
+- **Cold starts** are ~25 s after ~15 min idle. If that matters for a demo, add an EventBridge
+  rule hitting `/health` every 5 minutes (~9k invocations/month against the 1M free allowance).
+- **Function URL payloads cap at 6 MB** each way. `/compare` sends two full masked documents;
+  typical markdown memos are 100–300 KB, so there is headroom, but it is not unlimited.
+- **Malformed JSON returns 422, not 401.** FastAPI parses the body before solving dependencies,
+  so a request with bad JSON is rejected before the API-key check runs. No application logic
+  executes either way.
+- **Rotating the shared secret**: `aws ssm put-parameter --name CREDITRAG_API_KEY --overwrite`,
+  update `CLOUD_API_KEY` in `.env`, then force a new Lambda execution environment (the value is
+  cached per process for the life of the container).
+
+## What NOT to deploy
+
+- `local/` — the whole point is on-device masking; deploying it centralises raw PII.
+- `base_documents/` and the ingestion scripts — run once from your machine; Pinecone holds the result.
+- Any managed vector DB on AWS — none fit the free tier as comfortably as Pinecone's starter plan,
+  and the code targets Pinecone.

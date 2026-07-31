@@ -253,4 +253,12 @@ python eval/run_all.py --update-baseline                              # bless cu
 
 ## Deployment
 
-The cloud tier is the only deployable component — the local tier must stay on the analyst's machine by design. See **[DEPLOYMENT_AWS.md](DEPLOYMENT_AWS.md)** for a step-by-step AWS free-tier deployment (Lambda container + Function URL, SSM Parameter Store, optional DynamoDB telemetry).
+The cloud tier is the only deployable component — the local tier must stay on the analyst's machine by design.
+
+It runs as a **Lambda container behind a Function URL** in `ap-south-1`: 2048 MB / 300 s, image built and pushed to ECR by [.github/workflows/deploy.yml](.github/workflows/deploy.yml) on every push to `main` (GitHub OIDC, no long-lived AWS keys), gated on the privacy and adversarial masking evals. Secrets resolve from SSM Parameter Store; telemetry goes to DynamoDB. Cold start ~25 s, warm `/query` 8–15 s, ~$0.30/month.
+
+Requests to `/query`, `/compare` and `/ews` require an `X-API-Key` header matching the `CREDITRAG_API_KEY` secret ([auth.py](cloud/backend/app/auth.py)); the check self-disables when the secret is unset, so local development is unchanged. `/health` stays open for probes.
+
+Point the frontend at a deployment by setting `CLOUD_API_BASE` and `CLOUD_API_KEY` in `.env`.
+
+See **[DEPLOYMENT_AWS.md](DEPLOYMENT_AWS.md)** for the full runbook — including four traps that will otherwise cost you an afternoon: the base image must be `python:3.12` (the 3.11 runtime is glibc 2.26 and cannot install modern `manylinux_2_28` wheels), pip must be upgraded before installing, a public Function URL needs **two** IAM statements since October 2025, and `.dockerignore` is mandatory because the build context is otherwise 3.8 GB.
