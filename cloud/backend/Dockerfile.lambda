@@ -11,17 +11,25 @@
 # rejects the image with "The image manifest, config or layer media type for the
 # source image is not supported."
 
-FROM public.ecr.aws/lambda/python:3.11
+# 3.12, NOT 3.11 — this is a hard requirement, not a version preference.
+#
+# Lambda's python:3.11 base image runs on Amazon Linux 2 (glibc 2.26); AL2023
+# (glibc 2.34) only arrives with the python:3.12 runtime. numpy, faiss-cpu and
+# tiktoken now publish x86_64 Linux wheels exclusively under manylinux_2_27 /
+# manylinux_2_28 tags, which require glibc >= 2.27. On the 3.11 image not one
+# of those wheels is installable, so pip silently falls back to source tarballs
+# and the build dies in meson with "Unknown compiler(s)" — a Lambda base image
+# has no C toolchain. Pinning older package versions only postpones this.
+#
+# The application itself is version-agnostic; nothing here is 3.11-specific.
+FROM public.ecr.aws/lambda/python:3.12
 
 # ---------------------------------------------------------------------------
-# 0. Upgrade pip FIRST. This is load-bearing, not hygiene.
+# 0. Upgrade pip FIRST. Also load-bearing, not hygiene.
 #
-# The base image ships pip 24.0, which predates Metadata-Version 2.4. Wheels
-# published with that metadata (faiss-cpu, numpy, and a growing number of
-# others) are silently treated as incompatible, so pip falls back to their
-# source tarballs — and then meson dies with "Unknown compiler(s)" because a
-# Lambda base image has no C toolchain. Upgrading pip makes the wheels visible
-# again and keeps the build compiler-free.
+# The base image ships pip 24.0, which predates Metadata-Version 2.4 and treats
+# wheels carrying it as incompatible — the same silent sdist fallback by a
+# different route.
 # ---------------------------------------------------------------------------
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 
@@ -83,7 +91,8 @@ ENV HF_HUB_OFFLINE=1 \
     PYTHONDONTWRITEBYTECODE=1
 
 # Trim bytecode caches left by the model download step (~50-80 MB).
-RUN find /var/lang/lib/python3.11/site-packages -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+# Globbed so it survives a future base-image version bump.
+RUN find /var/lang/lib/python3.*/site-packages -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 
 # Mangum adapter exposed at app/main.py:49
 CMD ["app.main.handler"]
