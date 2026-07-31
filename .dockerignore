@@ -1,0 +1,36 @@
+# ---------------------------------------------------------------------------
+# Docker build context control.
+#
+# Both Dockerfiles build from the PROJECT ROOT (so shared/ is in context), and
+# the root is ~3.8 GB: local/slm/models/*.gguf is 2.3 GB, .git is 1.6 GB, and
+# cloud/backend/base_documents/ holds 17 MB of source PDFs. The cloud image
+# needs none of it. Without this file every build — including every CI build —
+# uploads all 3.8 GB to the builder before the first instruction runs.
+#
+# Strategy: deny everything, then allow back only what the Dockerfiles COPY.
+# Intermediate directories are re-included explicitly because an excluded
+# directory is pruned before its children are ever considered.
+# ---------------------------------------------------------------------------
+
+*
+
+# shared/ — imported by the cloud app (env, logging, masking, chunking, hybrid)
+!shared
+
+# cloud/backend/{app,requirements*.txt} — the service itself.
+# Deliberately NOT included: base_documents/ and chunks_staging.json (ingestion
+# inputs, run once from the analyst machine) and the 1_/2_ ingestion scripts.
+!cloud
+cloud/*
+!cloud/backend
+cloud/backend/*
+!cloud/backend/app
+!cloud/backend/requirements.txt
+!cloud/backend/requirements-lambda.txt
+
+# Belt and braces: never ship secrets or caches, even from inside the
+# allow-listed trees above.
+**/.env
+**/__pycache__
+**/*.pyc
+**/*.pyo

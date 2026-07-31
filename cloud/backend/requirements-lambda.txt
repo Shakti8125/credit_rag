@@ -1,0 +1,33 @@
+# Cloud tier — DEPLOYMENT dependencies only (AWS Lambda container image).
+#
+# Differs from requirements.txt in two deliberate ways:
+#
+#   - no `docling`: used exclusively by 1_extract_and_chunk.py. Ingestion runs
+#     once from the analyst machine and never inside Lambda; docling pulls
+#     torchvision plus OCR model weights and roughly doubles the image.
+#   - no `uvicorn[standard]`: nothing imports uvicorn (it is only ever a CLI
+#     entrypoint), and Mangum is the server adapter under Lambda. Dropping it
+#     also drops uvloop/httptools/watchfiles.
+#
+# torch is deliberately absent. Dockerfile.lambda installs the CPU-only build
+# from PyTorch's own index BEFORE this file is processed, so sentence-
+# transformers finds its torch dependency already satisfied and pip never
+# resolves the ~2.5 GB CUDA wheel from PyPI.
+
+fastapi
+mangum
+pydantic
+python-dotenv
+boto3
+
+# Generation
+google-genai
+
+# Retrieval
+pinecone
+sentence-transformers
+faiss-cpu
+numpy
+
+# Token gating (doc_injector)
+tiktoken

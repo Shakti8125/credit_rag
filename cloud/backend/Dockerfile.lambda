@@ -1,0 +1,77 @@
+# AWS Lambda container image for the cloud tier.
+#
+# BUILD FROM THE PROJECT ROOT so shared/ is inside the build context:
+#   docker build -f cloud/backend/Dockerfile.lambda -t creditrag-backend:lambda .
+#
+# In CI this is built by .github/workflows/deploy.yml and pushed to ECR.
+# See cloud/backend/Dockerfile for the uvicorn/EC2 variant of the same service.
+#
+# IMPORTANT: Lambda only accepts Docker v2 schema 2 manifests. If you build this
+# by hand with buildx, pass --provenance=false --platform linux/amd64, or Lambda
+# rejects the image with "The image manifest, config or layer media type for the
+# source image is not supported."
+
+FROM public.ecr.aws/lambda/python:3.11
+
+# ---------------------------------------------------------------------------
+# 1. CPU-only torch, installed BEFORE everything else.
+#
+# sentence-transformers depends on torch. If pip resolves it from PyPI it pulls
+# the CUDA build (~2.5 GB of NVIDIA libraries that can never execute on Lambda).
+# Installing from PyTorch's CPU index first means the dependency is already
+# satisfied when sentence-transformers is installed below.
+#
+# --index-url gets us the +cpu local-version wheels, which sort HIGHER than the
+# plain PyPI versions under PEP 440 and so win resolution; --extra-index-url
+# keeps ordinary PyPI available for torch's transitive deps (sympy, networkx…).
+# ---------------------------------------------------------------------------
+RUN pip install --no-cache-dir torch \
+        --index-url https://download.pytorch.org/whl/cpu \
+        --extra-index-url https://pypi.org/simple
+
+# ---------------------------------------------------------------------------
+# 2. Application dependencies (no docling, no uvicorn — see the file header).
+# ---------------------------------------------------------------------------
+COPY cloud/backend/requirements-lambda.txt ${LAMBDA_TASK_ROOT}/requirements.txt
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+# ---------------------------------------------------------------------------
+# 3. Application code.
+#
+# shared/ sits next to app/ under LAMBDA_TASK_ROOT, which is already on
+# sys.path, so `import shared` and `import app` both resolve with no path
+# manipulation. (app/main.py also inserts a computed project root into
+# sys.path; under Lambda that resolves to "/" and is harmless.)
+# ---------------------------------------------------------------------------
+COPY shared/            ${LAMBDA_TASK_ROOT}/shared/
+COPY cloud/backend/app/ ${LAMBDA_TASK_ROOT}/app/
+
+# ---------------------------------------------------------------------------
+# 4. Bake the transformer models into the image.
+#
+# The cross-encoder (~90 MB) and MiniLM embedder (~80 MB) are loaded eagerly by
+# retrieval.py and lazily by doc_search.py. Downloading them at runtime would
+# add tens of seconds to every cold start and fail outright if the VPC has no
+# egress — so they ship in the image.
+# ---------------------------------------------------------------------------
+ENV HF_HOME=/opt/hf-cache \
+    SENTENCE_TRANSFORMERS_HOME=/opt/hf-cache
+
+RUN python -c "from sentence_transformers import CrossEncoder, SentenceTransformer; \
+    CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2'); \
+    SentenceTransformer('all-MiniLM-L6-v2')"
+
+# Set only AFTER the download above, or it would have nothing to download.
+# At runtime the Lambda filesystem is read-only outside /tmp; without these,
+# huggingface_hub attempts a revision check and a lock-file write on every cold
+# start, which is both slow and a source of spurious errors.
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Trim bytecode caches left by the model download step (~50-80 MB).
+RUN find /var/lang/lib/python3.11/site-packages -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+
+# Mangum adapter exposed at app/main.py:49
+CMD ["app.main.handler"]

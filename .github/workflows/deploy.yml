@@ -1,0 +1,150 @@
+# Build the cloud-tier Lambda container image and ship it to AWS.
+#
+# The image (~2 GB: CPU torch + sentence-transformers + baked models) is built
+# on a GitHub runner rather than a developer machine, so nothing multi-GB ever
+# crosses a home connection and no local Docker daemon is required.
+#
+# Auth is OIDC — GitHub mints a short-lived token that AWS exchanges for the
+# creditrag-github-deploy role. There are no long-lived AWS keys in this repo.
+#
+# One-time setup (Settings → Secrets and variables → Actions → Variables):
+#   AWS_ROLE_ARN      arn:aws:iam::<account>:role/creditrag-github-deploy
+#   AWS_REGION        ap-south-1
+#   ECR_REPOSITORY    creditrag-backend
+#   LAMBDA_FUNCTION   creditrag-backend
+#   FUNCTION_URL      https://xxxx.lambda-url.ap-south-1.on.aws  (optional; enables the smoke test)
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cloud/backend/**"
+      - "shared/**"
+      - ".dockerignore"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+# Never let two deploys race for the same function.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # required to request the OIDC token
+  contents: read
+
+jobs:
+  # The privacy contract is this project's whole reason to exist, so a build
+  # that breaks masking must never reach a public endpoint. Same suites as
+  # eval.yml, re-run here as a release gate rather than a PR gate.
+  privacy-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install masking stack
+        run: |
+          pip install spacy python-dotenv requests
+          python -m spacy download en_core_web_lg
+
+      - name: Privacy eval (blocking)
+        run: python eval/privacy_eval.py
+
+      - name: Adversarial masking eval (blocking)
+        run: python eval/adversarial_eval.py
+
+  deploy:
+    needs: privacy-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'creditrag-backend' }}
+      LAMBDA_FUNCTION: ${{ vars.LAMBDA_FUNCTION || 'creditrag-backend' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # torch + transformers + the baked models need more headroom than a
+      # default runner leaves free. Reclaiming these three directories is the
+      # cheapest ~20 GB available and costs a few seconds.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          df -h /
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      # provenance:false is REQUIRED. Without it buildx attaches an attestation
+      # manifest and pushes an OCI image index, which Lambda refuses with
+      # "The image manifest, config or layer media type for the source image is
+      # not supported." Lambda accepts only Docker v2 schema 2 manifests.
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: cloud/backend/Dockerfile.lambda
+          push: true
+          provenance: false
+          sbom: false
+          platforms: linux/amd64
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Expected to no-op on the very first run: the image has to exist in ECR
+      # before the function can be created from it. Create the function once
+      # (DEPLOYMENT_AWS.md Step 5), then every later run updates it in place.
+      - name: Update Lambda function code
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+
+          if ! aws lambda get-function --function-name "$LAMBDA_FUNCTION" >/dev/null 2>&1; then
+            echo "::notice title=Function not found::Image pushed to ECR as $IMAGE, but Lambda function '$LAMBDA_FUNCTION' does not exist yet. Create it from this image, then re-run this workflow."
+            exit 0
+          fi
+
+          aws lambda update-function-code \
+            --function-name "$LAMBDA_FUNCTION" \
+            --image-uri "$IMAGE" \
+            --publish >/dev/null
+
+          aws lambda wait function-updated --function-name "$LAMBDA_FUNCTION"
+          echo "Deployed $IMAGE"
+
+      # A cold start on a fresh image is 60-90s (image pull + two model loads),
+      # so retry patiently rather than failing the deploy on the first timeout.
+      - name: Smoke test /health
+        if: vars.FUNCTION_URL != ''
+        run: |
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /tmp/health.json -w '%{http_code}' --max-time 120 "${{ vars.FUNCTION_URL }}/health" || echo 000)
+            if [ "$code" = "200" ]; then
+              echo "Healthy after ${i} attempt(s):"; cat /tmp/health.json; exit 0
+            fi
+            echo "attempt ${i}: HTTP ${code} — retrying"
+            sleep 15
+          done
+          echo "::error title=Smoke test failed::/health did not return 200. Check: aws logs tail /aws/lambda/${LAMBDA_FUNCTION}"
+          exit 1
