@@ -50,9 +50,12 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      # click is pinned in explicitly: typer 0.27.0 dropped it as a dependency,
+      # but spacy's CLI still does `from click import NoSuchOption`, so a fresh
+      # install leaves `python -m spacy download` crashing on ModuleNotFoundError.
       - name: Install masking stack
         run: |
-          pip install spacy python-dotenv requests
+          pip install spacy python-dotenv requests click
           python -m spacy download en_core_web_lg
 
       - name: Privacy eval (blocking)
